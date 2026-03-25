@@ -1,3 +1,3 @@
 # traffiQ
 
-Futur general description of Traffiq
+Future general description of Traffiq
