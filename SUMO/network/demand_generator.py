@@ -193,7 +193,7 @@ def _build_routes(entry_edges: List[str], all_edges: List[str]) -> List[Tuple[st
 
     return routes
 
-# ============ MAIN PUBLIC CLASS ============
+# ============ MAIN CLASS ============
 class DemandGenerator:
     """
     Generates SUMO traffic demand (.rou.xml) files for a compiled network.
