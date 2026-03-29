@@ -1,4 +1,4 @@
-# sumo/network/network_builder.py
+# traffic_sim/network/network_builder.py
 """
 NetworkBuilder
 

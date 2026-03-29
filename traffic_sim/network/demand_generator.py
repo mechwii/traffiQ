@@ -1,4 +1,4 @@
-# sumo/network/demand_generator.py
+# traffic_sim/network/demand_generator.py
 """
 DemandGenerator
 
