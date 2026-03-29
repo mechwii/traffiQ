@@ -2,7 +2,10 @@
 """
 NetworkBuilder
 
-This class generates SUMO-compatible road network files (.net.xml) using the plain XML format that SUMO's netconvert tool can compile.
+This class generates compatible road network files (.net.xml) using the plain XML format that SUMO's netconvert tool can compile.
+
+Both environments must implement identical road network structures. So we need to generate the single intersections (1, 2, and 3 lanes)
+and the multi-intersection grids before anything else can exist.
 
 Supported scenarios (from the project specification):
     Lane configurations : 1, 2 or 3 lanes per road
