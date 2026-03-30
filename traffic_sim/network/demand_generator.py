@@ -87,47 +87,91 @@ def _write_xml(path: str, element: ET.Element) -> None:
 
 def _parse_net_edges(net_file: str) -> Tuple[List[str], List[str]]:
     """
-    Parse a .net.xml file WITHOUT importing sumolib (so the file can be
-    generated and inspected even when SUMO is not installed yet).
+    Parse a COMPILED .net.xml file (output of netconvert).
+
+    The compiled format differs from the input .nod.xml / .edg.xml files:
+      - The root tag is <net>, not <nodes> or <edges>.
+      - Junctions are <junction id="..." type="..." ...> inside <net>.
+      - Road edges are <edge id="..." from="..." to="..."> with NO
+        'function' attribute (or function="normal").
+      - Internal SUMO connector edges have function="internal" AND their
+        id starts with ':' => we always skip both.
+ 
+    Dead-end border nodes have type="dead_end" in the compiled file,
+    exactly as we set in the .nod.xml — netconvert preserves this.
 
     Returns :
       entry_edges : list[str]
           Edges whose 'from' node is a dead_end (border) node — these are
           the edges on which vehicles enter the network.
-      internal_edges : list[str]
-          All other non-internal edges (used to build through-routes).
+      all_edges : list[str]
+        All non-internal road edges (entry + internal road segments).
 
     Note: SUMO internal edges start with ':' => we always skip those.
     """
     tree = ET.parse(net_file)
     root = tree.getroot()
 
-    # Build a set of dead-end node ids
-    dead_ends = set()
-    for node_el in root.iter("junction"):
-        if node_el.get("type") == "dead_end":
-            dead_ends.add(node_el.get("id"))
+    # 1. Collect dead-end (border) junction IDs
+    dead_ends: set = set()
+    for junction in root.iter("junction"):
+        jtype = junction.get("type", "")
+        if jtype == "dead_end":
+            dead_ends.add(junction.get("id"))
 
-    # Separate entry edges from internal / exit edges
+    print(f"  [DemandGenerator] Dead-end junctions found: {sorted(dead_ends)}")
+
+    # 2. Collect all road edges (skip internal connector edges)
     entry_edges: List[str] = []
-    all_edges: List[str] = []
+    all_edges:   List[str] = []
 
     for edge_el in root.iter("edge"):
-        eid = edge_el.get("id", "")
-
-        if eid.startswith(":"): # SUMO internal connector edge => skip
+        eid      = edge_el.get("id", "")
+        function = edge_el.get("function", "")
+ 
+        # Skip SUMO internal connector edges (id starts with ':' OR function == "internal")
+        if eid.startswith(":") or function == "internal":
             continue
-        
+ 
         from_node = edge_el.get("from", "")
         to_node   = edge_el.get("to",   "")
-
+ 
         all_edges.append(eid)
-
-        # Entry edge: starts at a dead-end border node -> going INTO network
+ 
+        # Entry edge: originates at a border dead-end node, points inward
         if from_node in dead_ends and to_node not in dead_ends:
             entry_edges.append(eid)
-
+ 
+    # 3. Fallback: if dead_end detection failed (e.g. netconvert changed
+    #    the type label), infer entry edges from naming convention.
+    #    Our NetworkBuilder names border nodes N, S, E, W, N0, S0, etc.
+    #    Entry edges therefore have IDs like "N_to_C", "W0_to_J0", etc.
+    if not entry_edges and all_edges:
+        print(
+            "  [DemandGenerator] WARNING: No dead-end junctions detected. "
+            "Falling back to name-based entry-edge detection."
+        )
+        # Border node prefixes used by NetworkBuilder
+        BORDER_PREFIXES = ("N", "S", "E", "W")
+ 
+        for edge_el in root.iter("edge"):
+            eid      = edge_el.get("id", "")
+            function = edge_el.get("function", "")
+            if eid.startswith(":") or function == "internal":
+                continue
+ 
+            from_node = edge_el.get("from", "")
+            # from_node is a border node if it starts with N/S/E/W
+            # AND the edge id follows the "X_to_Y" naming convention
+            if (
+                from_node
+                and any(from_node.startswith(p) for p in BORDER_PREFIXES)
+                and "_to_" in eid
+            ):
+                entry_edges.append(eid)
+ 
     return entry_edges, all_edges
+
 
 def _build_routes(entry_edges: List[str], all_edges: List[str]) -> List[Tuple[str, str]]:
     """
