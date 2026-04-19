@@ -42,6 +42,10 @@ try:
 except ImportError:
     PANDAS_AVAILABLE = False
 
+# A vehicle is considered "waiting" when its speed falls below this threshold.
+# 0.1 m/s is the standard SUMO convention for a stationary vehicle.
+WAITING_SPEED_THRESHOLD = 0.1
+
 
 class StatisticsCollector:
     """
@@ -132,12 +136,20 @@ class StatisticsCollector:
         self._throughput       += arrived_this_step
         self._total_departed   += departed_this_step
 
-        # Track departure times for travel-time calculation
-        # Get newly departed vehicle IDs (approximation: newly in ID list)
-        # A more precise approach requires a subscription; this is sufficient.
+        # Track departure times: record sim_time when each vehicle first appears.
         for vid in vehicle_ids:
             if vid not in self._departure_times:
                 self._departure_times[vid] = sim_time
+
+        # Compute travel times for vehicles that completed their trip this step.
+        # getArrivedIDList() returns every vehicle that reached its destination
+        # during this simulation step — this is the correct TraCI call (was
+        # previously missing, which caused mean_travel_time to always be 0.0).
+        for vid in traci.simulation.getArrivedIDList():
+            if vid in self._departure_times:
+                travel_time = sim_time - self._departure_times.pop(vid)
+                if travel_time > 0:
+                    self._travel_times.append(travel_time)
 
         # Mean travel time
         mean_travel_time = (
@@ -150,7 +162,7 @@ class StatisticsCollector:
         elapsed_minutes    = (sim_time / 60.0) if sim_time > 0 else 1.0
         vehicles_per_minute = self._throughput / elapsed_minutes
 
-        waiting_count     = sum(1 for s in speeds if s < 0.1)
+        waiting_count     = sum(1 for s in speeds if s < WAITING_SPEED_THRESHOLD)
         congestion_index  = waiting_count / n_vehicles if n_vehicles else 0.0
 
         # Build result dict
