@@ -32,12 +32,12 @@ from traffic_sim.sumo_env.sumo_environment import SumoEnvironment
 
 
 SCENARIO = {
-    "intersection_type": "t_junction",   # "four_way" | "t_junction" | "complex"
-    "num_intersections": 4,            # 1 | 2 | 4 | 8
+    "intersection_type": "four_way",   # "four_way" | "t_junction" | "complex"
+    "num_intersections": 1,            # 1 | 2 | 4 | 8
     "num_lanes":         3,            # 1 | 2 | 3
 }
 
-DEMAND_LEVEL  = "high"   # "low" | "moderate" | "high" | "congested"
+DEMAND_LEVEL  = "congested"   # "low" | "moderate" | "high" | "congested"
 SIMULATION_DURATION = 300   
 USE_GUI       = True         #  True for opening the visual window
 CONFIGS_DIR   = "configs"
@@ -54,6 +54,7 @@ def print_state(step: int, state: dict, stats: dict) -> None:
         f"waiting={stats['mean_waiting_time']:>6.1f}s | "
         f"throughput={stats['throughput']:>4} | "
         f"congestion={stats['congestion_index']:.2f}"
+        f" | collisions={stats['total_collisions']}"
     )
 
 def main():
@@ -125,9 +126,11 @@ def main():
         done = info["done"]
         step = info["step"]
 
+        # Collect statistics
+        stats = env.statistics()
+
         #  Collect and display stats 
         if step % PRINT_EVERY == 0 or done:
-            stats = env.statistics()
             print_state(step, state, stats)
 
     # 5. Episode summary

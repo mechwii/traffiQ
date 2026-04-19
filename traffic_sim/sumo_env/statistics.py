@@ -59,6 +59,7 @@ class StatisticsCollector:
         # Cumulative counters reset at each episode (reset())
         self._throughput: int = 0          # total vehicles that arrived
         self._total_departed: int = 0      # total vehicles that departed
+        self._total_collisions: int = 0
 
         # Per-step history (list of stat dicts)
         self._history: List[Dict[str, Any]] = []
@@ -136,6 +137,13 @@ class StatisticsCollector:
         self._throughput       += arrived_this_step
         self._total_departed   += departed_this_step
 
+        # Collision count (if enabled in SUMO config)
+        # collisions_this_step = traci.simulation.getCollidingVehiclesNumber()
+        collisions_this_step = len(traci.simulation.getCollisions())
+        self._total_collisions += collisions_this_step
+
+        
+
         # Track departure times: record sim_time when each vehicle first appears.
         for vid in vehicle_ids:
             if vid not in self._departure_times:
@@ -177,10 +185,15 @@ class StatisticsCollector:
             "mean_travel_time":   round(mean_travel_time,  3),
             "vehicles_per_minute": round(vehicles_per_minute, 2),
             "congestion_index":   round(congestion_index,  3),
+            "total_collisions":   self._total_collisions,
         }
 
         # Append to history
         self._history.append(result)
+
+        # arrived_ids = traci.simulation.getArrivedIDList()
+        # if len(arrived_ids) > 0:
+        #    print(f"[DEBUG] t={sim_time}s -> Theses cars have arrived : {arrived_ids}")
 
         return result
 
@@ -212,6 +225,7 @@ class StatisticsCollector:
             "peak_congestion":       round(max(all_congestion), 3),
             "mean_travel_time":      self._history[-1]["mean_travel_time"],
             "wall_time_seconds":     round(elapsed_wall, 2),
+            "total_collisions":   self._total_collisions,
         }
 
     # ---- Exportation ----
@@ -258,6 +272,7 @@ class StatisticsCollector:
         self._departure_times   = {}
         self._travel_times      = []
         self._episode_start     = time.time()
+        self._total_collisions = 0
 
     # ---- Properties ----
 

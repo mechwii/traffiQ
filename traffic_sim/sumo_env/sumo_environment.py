@@ -339,6 +339,10 @@ class SumoEnvironment:
                 - total_vehicles    => vehicles currently in network
                 - mean_travel_time  => average travel time of completed trips (s)
                 - step             => current step number
+                - simulation_time   => current simulation clock (s)
+                - congestion_index  => mean occupancy across all edges (%)
+                - peak_congestion  => max occupancy across all edges (%)
+                - total_collisions  => total number of collisions (if enabled in SUMO)
         """
         self._check_running()
         return self.statistics_collector.statistics()
