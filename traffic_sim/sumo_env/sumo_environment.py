@@ -413,8 +413,8 @@ class SumoEnvironment:
 
         # <input> block
         inp = ET.SubElement(config, "input")
-        ET.SubElement(inp, "net-file",    attrib={"value": self.net_file})
-        ET.SubElement(inp, "route-files", attrib={"value": self.route_file})
+        ET.SubElement(inp, "net-file",    attrib={"value": os.path.basename(self.net_file)})
+        ET.SubElement(inp, "route-files", attrib={"value": os.path.basename(self.route_file)})
 
         # <time> block
         tim = ET.SubElement(config, "time")
@@ -430,12 +430,12 @@ class SumoEnvironment:
         ET.SubElement(proc, "time-to-teleport",      attrib={"value": "-1"})
         ET.SubElement(proc, "waiting-time-memory",   attrib={"value": "10000"})
         ET.SubElement(proc, "collision.action",      attrib={"value": "warn"})
-        ET.SubElement(proc, "default.junctions.keep-clear", attrib={"value": "true"})
 
         # Pretty-print and write
         raw      = ET.tostring(config, encoding="unicode")
         pretty   = minidom.parseString(raw).toprettyxml(indent="    ")
-        cfg_path = os.path.splitext(self.net_file)[0] + ".sumocfg"
+        base = (self.net_file[:-len(".net.xml")] if self.net_file.endswith(".net.xml") else os.path.splitext(self.net_file)[0])
+        cfg_path = base + ".sumocfg"
         with open(cfg_path, "w", encoding="utf-8") as fh:
             fh.write(pretty)
 

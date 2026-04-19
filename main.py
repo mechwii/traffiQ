@@ -37,8 +37,8 @@ SCENARIO = {
     "num_lanes":         3,            # 1 | 2 | 3
 }
 
-DEMAND_LEVEL  = "moderate"   # "low" | "moderate" | "high" | "congested"
-SIMULATION_DURATION = 1000   
+DEMAND_LEVEL  = "high"   # "low" | "moderate" | "high" | "congested"
+SIMULATION_DURATION = 300   
 USE_GUI       = True         #  True for opening the visual window
 CONFIGS_DIR   = "configs"
 PRINT_EVERY   = 50           # print stats every N steps
@@ -134,7 +134,6 @@ def main():
     print()
     env.statistics_collector.print_summary()
 
-    # Optional : export to CSV for analysis
     try:
         df = env.statistics_collector.to_dataframe()
         csv_path = os.path.join(
