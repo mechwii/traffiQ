@@ -449,21 +449,18 @@ class NetworkBuilder:
         builder.build_all()
     """
 
-    # All scenarios from the specification
+    # All scenarios from the specification.
+    # Single intersections support all three geometry types × all lane counts.
+    # Multi-intersection grids support all lane counts (always four-way geometry).
     SCENARIOS = [
-        # (intersection_type, num_intersections, num_lanes)
-        ("four_way",  1, 1),
-        ("four_way",  1, 2),
-        ("four_way",  1, 3),
-        ("four_way",  2, 1),
-        ("four_way",  4, 1),
-        ("four_way",  8, 1),
-        ("t_junction", 1, 1),
-        ("t_junction", 1, 2),
-        ("t_junction", 1, 3),
-        ("complex",    1, 1),
-        ("complex",    1, 2),
-        ("complex",    1, 3),
+        # -- Single intersection, all geometries, all lane counts --
+        ("four_way",   1, 1), ("four_way",   1, 2), ("four_way",   1, 3),
+        ("t_junction", 1, 1), ("t_junction", 1, 2), ("t_junction", 1, 3),
+        ("complex",    1, 1), ("complex",    1, 2), ("complex",    1, 3),
+        # -- Multi-intersection grids (four-way), all lane counts --
+        ("four_way",   2, 1), ("four_way",   2, 2), ("four_way",   2, 3),
+        ("four_way",   4, 1), ("four_way",   4, 2), ("four_way",   4, 3),
+        ("four_way",   8, 1), ("four_way",   8, 2), ("four_way",   8, 3),
     ]
 
     def __init__(self, output_dir: str = "configs", sumo_home: str = None):
