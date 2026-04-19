@@ -215,16 +215,18 @@ class _LayoutGenerator:
         return nodes, edges
     
     def multi_intersection(
-        self, count: int, intersection_type: str = "four_way"
+        self, count: int,
+        intersection_type: str = "four_way"
     ) -> Tuple[List[Node], List[Edge]]:
         """
-        Build a linear chain of count four-way intersections connected
-        by shared road segments.
+        Build a grid of count four-way intersection (maybe other types) connected by shared road
+        segments. Multi-intersection networks always use four-way (+) (for now) geometry
+        as shown in the project specification diagrams.
 
-        For count=2:   
+        For count=2:
         + ------- +
 
-        For count=4: 
+        For count=4:
         + --- +
         |     |
         + --- +
@@ -580,7 +582,8 @@ class NetworkBuilder:
                 )
         else:
             # Multi-intersection layouts are always four-way grids
-            return gen.multi_intersection(num_intersections, intersection_type)
+            # return gen.multi_intersection(num_intersections, intersection_type)
+            return gen.multi_intersection(num_intersections)
 
     @staticmethod
     def _write_nodes(path: str, nodes: List[Node]) -> None:

@@ -155,10 +155,11 @@ class ActionHandler:
                                (useful for RL agents that set precise speeds)
         
         Parameters :
-            - actions : dict | list | None
-                Control commands (see formats above).
+            vehicle_ids : list[str] | None
+                IDs of vehicles to update.  If None, all vehicles currently
+                in the simulation are updated.
 
-            - mode : int
+            mode : int
                 Speed mode bitmask (default 31 = all SUMO checks active).
         """
         targets = vehicle_ids or list(traci.vehicle.getIDList())

@@ -137,8 +137,9 @@ class StateExtractor:
         Retrieve the frontmost vehicle (leader) for every lane.
 
         Strategy :
-            For each lane in the network, find the vehicle with the lowest
-            lanePosition value (closest to the lane end / intersection).
+            For each lane in the network, find the vehicle with the HIGHEST
+            lanePosition value (furthest along the lane = closest to its end
+            = the leader approaching the intersection).
 
         TraCI does not have a direct "get lane leader" call, so we:
           1. Group vehicles by lane.
