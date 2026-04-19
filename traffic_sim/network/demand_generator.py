@@ -175,65 +175,87 @@ def _parse_net_edges(net_file: str) -> Tuple[List[str], List[str]]:
 
 def _build_routes(entry_edges: List[str], all_edges: List[str]) -> List[Tuple[str, str]]:
     """
-    Build simple two-edge through-routes: entry_edge -> exit_edge.
+    Build all valid through-routes using BFS on the edge graph.
 
-    Strategy: for each entry edge "X_to_Y", the complementary exit edge
-    is "Y_to_Z" for each Z != X.  This covers straight-through and turning
-    movements without path-finding.
+    This replaces the old two-edge heuristic that failed for multi-intersection
+    networks (4 / 8 intersections) because vehicles need to traverse several
+    edges to cross the full grid.
 
-    For multi-intersection networks a full graph search would be needed;
-    here we use a heuristic:  pair every entry edge with every other entry
-    edge whose direction is not exactly opposite (avoids U-turns).
+    Strategy:
+      1. Build an adjacency map:  from_node -> [edge_id, ...]
+      2. For every entry edge, run BFS until we reach another border node
+         (a dead_end that is NOT the one we started from).
+      3. Every such complete path becomes a route.
+
+    Dead_end border nodes are inferred from the entry_edges list:
+    an entry edge "X_to_Y" starts at border node X.
 
     Returns:
-      list of (route_id, edge_sequence_string) tuples
+        list of (route_id, edge_sequence_string) tuples
     """
-    routes: List[Tuple[str, str]] = []
 
-    # Build a fast look-up: edge_id -> (from_node, to_node)
-    # We reconstruct this from edge naming convention "X_to_Y"
+    # ---- helpers ----
     def nodes_from_id(eid: str):
+        """Extract (from_node, to_node) from edge id 'X_to_Y'."""
         parts = eid.split("_to_")
         if len(parts) == 2:
             return parts[0], parts[1]
         return None, None
-    
-    # Group entry edges by their destination junction
-    by_dest: Dict[str, List[str]] = {}
-    for eid in entry_edges:
-        _, dest = nodes_from_id(eid)
-        if dest:
-            by_dest.setdefault(dest, []).append(eid)
 
-    # For each junction, pair every inbound entry edge with every outbound
-    # entry edge that leads away from that junction
-    # (outbound edges start AT the junction, their 'from' = junction)
-    outbound: Dict[str, List[str]] = {}
+    # ---- build adjacency: to_node -> list[(edge_id, to_node)] ----
+    # We index by the node a vehicle ARRIVES AT so we can extend paths.
+    adjacency: Dict[str, List[Tuple[str, str]]] = {}
     for eid in all_edges:
+        frm, to = nodes_from_id(eid)
+        if frm and to:
+            adjacency.setdefault(frm, []).append((eid, to))
+
+    # ---- collect border nodes (dead_ends) ----
+    # Every entry edge originates at a border node.
+    border_nodes: set = set()
+    for eid in entry_edges:
         frm, _ = nodes_from_id(eid)
         if frm:
-            outbound.setdefault(frm, []).append(eid)
+            border_nodes.add(frm)
 
+    # ---- BFS from each entry edge ----
+    routes: List[Tuple[str, str]] = []
     route_idx = 0
-    seen = set()
+    seen_paths: set = set()  # avoid duplicates
 
-    for junction, inbounds in by_dest.items():
-        exits = outbound.get(junction, [])
-        for in_edge in inbounds:
-            in_from, _ = nodes_from_id(in_edge)
-            for out_edge in exits:
-                _, out_to = nodes_from_id(out_edge)
-                # Skip U-turns (returning to the same border)
-                if out_to == in_from:
-                    continue
-                # Skip duplicate pairs
-                key = (in_edge, out_edge)
-                if key in seen:
-                    continue
-                seen.add(key)
-                route_id = f"route_{route_idx}"
-                routes.append((route_id, f"{in_edge} {out_edge}"))
-                route_idx += 1
+    for start_edge in entry_edges:
+        start_from, start_to = nodes_from_id(start_edge)
+        if not start_to:
+            continue
+
+        # BFS state: (current_node, path_of_edges_so_far)
+        # We limit depth to avoid infinite loops in cyclic grids.
+        MAX_DEPTH = 20
+        queue: List[Tuple[str, List[str]]] = [(start_to, [start_edge])]
+
+        while queue:
+            current_node, path = queue.pop(0)
+
+            if len(path) > MAX_DEPTH:
+                continue
+
+            # If we reached a border node that is NOT our origin => valid route
+            if current_node in border_nodes and current_node != start_from:
+                key = tuple(path)
+                if key not in seen_paths:
+                    seen_paths.add(key)
+                    route_id = f"route_{route_idx}"
+                    routes.append((route_id, " ".join(path)))
+                    route_idx += 1
+                continue  # don't extend further past a border exit
+
+            # Extend path through all outgoing edges from current_node
+            for next_edge, next_node in adjacency.get(current_node, []):
+                # Avoid revisiting nodes already in this path (no loops)
+                nodes_visited = {nodes_from_id(e)[0] for e in path}
+                nodes_visited.add(start_from)
+                if next_node not in nodes_visited:
+                    queue.append((next_node, path + [next_edge]))
 
     return routes
 
@@ -303,11 +325,11 @@ class DemandGenerator:
                   f"Choose from: {list(DEMAND_LEVELS.keys())}"
             )
         
-        if not self.routes:
-             raise RuntimeError(
+        if not self._routes:
+            raise RuntimeError(
                 "No valid through-routes could be built from this network. "
                 "Check that the .net.xml contains proper dead_end border nodes."
-            )          
+            )
 
         vph = DEMAND_LEVELS[level] # vehicles per hour per entry edge
         end = begin + duration 
