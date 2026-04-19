@@ -204,8 +204,9 @@ class SumoEnvironment:
         if self._simulation_running:
             self._close_traci()
 
-        # Build the SUMO command
-        sumo_cmd = self._build_sumo_command()
+        # Build the SUMO command (writes .sumocfg first for realistic junction behaviour)
+        cfg_path = self._write_sumocfg()
+        sumo_cmd = self._build_sumo_command(cfg_path)
         print(f"[SumoEnvironment] Launching SUMO: {' '.join(sumo_cmd)}")
 
         # Start SUMO and connect TraCI
@@ -241,7 +242,8 @@ class SumoEnvironment:
                 - list       => list of actions to apply via ActionHandler
 
             simulation_time : float | None
-                If provided, advance the simulation to this absolute time (s).
+                If provided, advance the simulation to this absolute time (s),
+                applying the action at every sub-step along the way.
                 If None, advance by exactly one step_length.
 
         Returns :
@@ -259,24 +261,26 @@ class SumoEnvironment:
                 "Simulation is not running.  Call reset() first."
             )
 
-        # 1. Apply the action
-        if action is not None:
-            self.action_handler.set_action(action)
-
-        # 2. Advance simulation
+        # 1. Advance simulation (action applied inside the loop / before the step)
         if simulation_time is not None:
-            # Advance to a specific absolute time
+            # Advance to a specific absolute time, applying the action at
+            # every sub-step so control is consistent across the whole interval.
             while traci.simulation.getTime() < simulation_time:
+                if action is not None:
+                    self.action_handler.set_action(action)
                 traci.simulationStep()
+                self._current_step += 1
         else:
+            # Single step: apply action once, then advance.
+            if action is not None:
+                self.action_handler.set_action(action)
             traci.simulationStep()
+            self._current_step += 1
 
-        self._current_step += 1
-
-        # 3. Collect new state
+        # 2. Collect new state
         state = self.create_state()
 
-        # 4. Check termination
+        # 3. Check termination
         done = self._is_done()
 
         info = {
@@ -387,19 +391,63 @@ class SumoEnvironment:
 
     # ---- Internal Helpers ----
 
-    def _build_sumo_command(self) -> List[str]:
+    def _write_sumocfg(self) -> str:
+        """
+        Write a .sumocfg configuration file next to the net file and return
+        its path.  Using a .sumocfg is the standard SUMO workflow and allows
+        netconvert / SUMO to apply correct turn-movement rules at
+        unsignalized intersections (right-of-way type = "right_before_left"
+        by default, which is the most realistic setting for urban intersections).
+        The file is (re)written on every reset() so it always reflects the
+        current net_file / route_file paths.
+        """
+        import xml.etree.ElementTree as ET
+        from xml.dom import minidom
+
+        config = ET.Element("configuration")
+        config.set("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance")
+        config.set(
+            "xsi:noNamespaceSchemaLocation",
+            "http://sumo.dlr.de/xsd/sumoConfiguration.xsd",
+        )
+
+        # <input> block
+        inp = ET.SubElement(config, "input")
+        ET.SubElement(inp, "net-file",    attrib={"value": self.net_file})
+        ET.SubElement(inp, "route-files", attrib={"value": self.route_file})
+
+        # <time> block
+        tim = ET.SubElement(config, "time")
+        ET.SubElement(tim, "step-length", attrib={"value": str(self.step_length)})
+
+        # <report> block — suppress noisy console output
+        rep = ET.SubElement(config, "report")
+        ET.SubElement(rep, "no-warnings",  attrib={"value": "true"})
+        ET.SubElement(rep, "no-step-log",  attrib={"value": "true"})
+
+        # <processing> block — realistic unsignalized intersection behaviour
+        proc = ET.SubElement(config, "processing")
+        ET.SubElement(proc, "time-to-teleport",      attrib={"value": "-1"})
+        ET.SubElement(proc, "waiting-time-memory",   attrib={"value": "10000"})
+        ET.SubElement(proc, "collision.action",      attrib={"value": "warn"})
+        ET.SubElement(proc, "default.junctions.keep-clear", attrib={"value": "true"})
+
+        # Pretty-print and write
+        raw      = ET.tostring(config, encoding="unicode")
+        pretty   = minidom.parseString(raw).toprettyxml(indent="    ")
+        cfg_path = os.path.splitext(self.net_file)[0] + ".sumocfg"
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            fh.write(pretty)
+
+        print(f"[SumoEnvironment] sumocfg written: {cfg_path}")
+        return cfg_path
+
+    def _build_sumo_command(self, cfg_path: str) -> List[str]:
         """Assemble the command line arguments for launching SUMO."""
         cmd = [
             self._sumo_bin,
-            "--net-file",   self.net_file,
-            "--route-files", self.route_file,
-            "--step-length", str(self.step_length),
-            "--seed",        str(self.seed),
-            "--no-warnings",
-            "--no-step-log",            # suppress per-step console output
-            "--waiting-time-memory", "10000",  # track waiting time history
-            "--time-to-teleport", "-1",  # disable teleporting (no disappearing vehicles)
-            "--collision.action", "warn",
+            "-c", cfg_path,           # use the generated .sumocfg
+            "--seed", str(self.seed),
         ]
         # GUI-specific options
         if self.use_gui:
