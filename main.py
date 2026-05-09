@@ -29,12 +29,23 @@ from traffic_sim.network.network_builder import NetworkBuilder
 from traffic_sim.network.demand_generator import DemandGenerator
 from traffic_sim.sumo_env.sumo_environment import SumoEnvironment
 
+"""
+TODO 
+Construire un état en fonction de la situation actuellee en construisant un vecteur contenant les états actuels
+Ce sera ce vecteur qui sera envoyé à l'IA. Voir aussi l'histoire de la zone
+                speed/14 => 14 vitese max
+                                acceleration/4, => 4 accccelaration maxmale
 
+blanc si arrivé
+couleur dépend de la vitesse
+générer image qu'interprétera l'agent IA
+50 x 50 taille prédéfini
+"""
 
 SCENARIO = {
-    "intersection_type": "four_way",   # "four_way" | "t_junction" | "complex"
-    "num_intersections": 1,            # 1 | 2 | 4 | 8
-    "num_lanes":         3,            # 1 | 2 | 3
+    "intersection_type": "complex",   # "four_way" | "t_junction" | "complex"
+    "num_intersections": 8,            # 1 | 2 | 4 | 8
+    "num_lanes":         2,            # 1 | 2 | 3
 }
 
 DEMAND_LEVEL  = "congested"   # "low" | "moderate" | "high" | "congested"
