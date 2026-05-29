@@ -6,4 +6,5 @@ matplotlib>=3.7.0
 lxml>=4.9.0
 eclipse-sumo
 keras
-tensorflow
+# tensorflow
+tensorflow<2.16

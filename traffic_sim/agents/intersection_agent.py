@@ -65,7 +65,8 @@ except ImportError:
 
 # Lane direction order  (must match how NetworkBuilder names lanes)
 # The teacher trained with West=0, South=1, East=2, North=3.
-DIRECTION_ORDER: List[str] = ["W", "S", "E", "N"]
+# DIRECTION_ORDER: List[str] = ["W", "S", "E", "N"]
+DIRECTION_ORDER: List[str] = ["N", "W", "E", "S"]
 
 # The AI's brain only has 4 slots to receive information: "W", "S", "E", and "N".
 # This dictionary tells the code how to map any complex lane names back into 
@@ -132,7 +133,9 @@ def _int_to_bits(action_int: int, n_bits: int = 8) -> List[int]:
     # To match up with the correct "West, South, East, North" order the AI expects, 
     # we have to flip the list around so it reads from left to right.
     # [0, 1, 1, 0, 0, 0, 0, 0] becomes -> [0, 0, 0, 0, 0, 1, 1, 0]
-    return list(reversed(bits))
+    # return [0, 0, 0, 0, 0, 1, 1, 0]
+    result = list(reversed(bits))
+    return result
 
 class IntersectionAgent:
     """
@@ -212,23 +215,59 @@ class IntersectionAgent:
         #   index  5 -> follower East  (ignored)
         #   index  6 -> leader  North
         #   index  7 -> follower North (ignored)
+        """
         direction_bits: Dict[str, int] = {
             "W": bits[0],
             "S": bits[2],
             "E": bits[4],
             "N": bits[6],
         }
+        """
+
+        # The AI was trained to output its decisions in a strict sequence
+        # based on the teacher's original edge names ("1to2", "5to2", etc.).
+        # We map your new string labels ("N", "E", "W", "S") to the exact 
+        # bit indices the AI expects them to be at.
+        direction_bits: Dict[str, int] = {
+            # bits[0] was trained to control "1to2" in the teacher's code.
+            # In our new map, "1to2" corresponds to the North traffic light.
+            "N": bits[0],  
+            
+            # bits[2] was trained to control "5to2" in the teacher's code.
+            # In our new map, "5to2" corresponds to the East traffic light.
+            "E": bits[2],  
+            
+            # bits[4] was trained to control "3to2" in the teacher's code.
+            # In our new map, "3to2" corresponds to the West traffic light.
+            "W": bits[4],  
+            
+            # bits[6] was trained to control "4to2" in the teacher's code.
+            # In our new map, "4to2" corresponds to the South traffic light.
+            "S": bits[6],  
+        }
 
         # Build {lane_id: 0|1} for every leader lane we can classify
         action: Dict[str, int] = {}
         for lane_id, vehicle_id in leaders.items():
             if vehicle_id is None:
-                continue   # empty lane - no action needed
+                continue   # empty lane -> no action needed
             direction = _lane_to_direction(lane_id)
             if direction is None:
-                continue   # outgoing lane or unknown - skip
+                continue   # outgoing lane or unknown -> skip
             action[lane_id] = direction_bits.get(direction, 0)
 
+        # If the dictionary has values, AND all the values are 0,
+        # this means the AI has ordered everyone to stop (Deadlock).
+        if action and all(val == 0 for val in action.values()):
+            # Force all leaders to 1 (Go).
+            # Thanks to your ActionHandler, this gives control back to SUMO (-1.0).
+            # SUMO will then use right-of-way rules to safely clear
+            # the intersection without causing any accidents!
+            print("[DEADLOCK] We put all values to 1!")
+            for lane_id in action.keys():
+                action[lane_id] = 1
+        
+        print(action)
         return action
     
     # ------ Internal 
