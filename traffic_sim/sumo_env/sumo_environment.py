@@ -6,7 +6,7 @@ SumoEnvironment
 
     env = SumoEnvironment(...)
     env.start()
-    obs = env.reset()
+    obs = env.reset() -> ndarray (n, n, 3)
     while not done:
         obs, info = env.step(action, simulation_time)
     env.close()
@@ -23,25 +23,44 @@ Key TraCI concepts used here:
   - traci.vehicle.*     => vehicle state and control commands
   - traci.edge.*        => edge-level statistics
 
-Parameters :
-    net_file : str
-        Path to the compiled .net.xml file.
-    route_file : str
-        Path to the .rou.xml traffic demand file.
-    use_gui : bool
-        If True, launches sumo-gui (visual mode).  If False, uses sumo
-        (headless, faster for experiments).
-    step_length : float
-        Duration of each simulation step in seconds (default 1.0).
-    max_steps : int
-        Maximum number of steps before the episode ends (default 3600 = 1 hour).
-    sumo_home : str | None
-        Path to SUMO installation.  Falls back to $SUMO_HOME env variable.
-    port : int
-        TraCI connection port (default 8813).  Change if running multiple
-        instances in parallel.
-    seed : int
-        Random seed passed to SUMO for reproducible vehicle insertion.
+--------------------------------------------------------------------------
+WHAT CHANGED vs. the original version
+--------------------------------------------------------------------------
+1. ``step()`` now returns the standard RL 4-tuple:
+       (observation, reward, done, info)
+ 
+2. ``reset()`` now returns an ``observation`` dict.
+ 
+3. New sub-component: ``ObservationBuilder`` (observation.py)
+   builds the (nxnx3) RGB image every step.
+ 
+4. Reward = traci.simulation.getArrivedNumber()  - exactly the teacher's
+   reference.  One positive integer per vehicle that completed its route
+   this step.  No configuration needed.
+ 
+5. Action format  {lane_id: 0 | 1}
+       1 -> leader of that lane is allowed to go  (speed = -1, SUMO default)
+       0 -> leader of that lane is stopped        (speed = 0)
+   The legacy ActionHandler formats (speed dict, list of action dicts) are
+   also still accepted for non-RL usage.
+ 
+6. The ``observation`` dict returned every step contains:
+       "image"   -> ndarray (n, n, 3) uint8 - sent to the agent
+       "state"   -> dict               - raw TraCI snapshot (for debugging)
+       "leaders" -> dict               - {lane_id: vehicle_id | None}
+ 
+--------------------------------------------------------------------------
+Extending the action space
+--------------------------------------------------------------------------
+Currently: discrete  {lane_id: 0 | 1}
+Later continuous:    {lane_id: float}  (target speed in m/s)
+ 
+The dispatch logic is in ``_apply_action()``.  To add continuous actions:
+    1. Check ``isinstance(v, float) and v > 1`` in ``_apply_action()``.
+    2. Call ``self.action_handler._apply_speed(vehicle_id, v)``.
+No other method needs to change.
+--------------------------------------------------------------------------
+
 """
 
 import os
@@ -71,6 +90,7 @@ except ImportError:
 from .state import StateExtractor
 from .actions import ActionHandler
 from .statistics import StatisticsCollector
+from .observation import ObservationBuilder
 
 
 class SumoEnvironment:
@@ -85,6 +105,38 @@ class SumoEnvironment:
 
     The environment can be reset() multiple times without calling start()
     again (useful for running multiple episodes in a training loop).
+
+    Parameters
+    ----------
+    net_file : str
+        Path to the compiled .net.xml file.
+    route_file : str
+        Path to the .rou.xml traffic demand file.
+    use_gui : bool
+        Launch sumo-gui (visual) instead of headless sumo.
+    step_length : float
+        Duration of each simulation step in seconds.
+    max_steps : int
+        Maximum steps per episode before ``done=True``.
+    sumo_home : str | None
+        SUMO installation directory.  Falls back to $SUMO_HOME.
+    port : int
+        TraCI connection port.  Change when running parallel instances.
+    seed : int
+        Random seed for reproducible vehicle insertion.
+
+    -- Observation parameters ----------------------------------------
+    image_size : int
+        Side length in pixels of the RGB image sent to the agent.
+        Default 50  -> shape (50, 50, 3).
+    dest_colors : dict | None
+        {edge_id: (R, G, B)} colour table for the image.
+        Pass this to match your own network's exit edge names.
+    intersection_outgoing : set | None
+        Edge IDs outgoing from the main intersection (drawn white).
+    bbox : tuple | None
+        World-space bounding box: ((xmin, ymin), (xmax, ymax)).
+
     """
 
     def __init__(
@@ -97,6 +149,11 @@ class SumoEnvironment:
         sumo_home: str = None,
         port: int = 8813,
         seed: int = 42,
+        image_size:             int             = 50,
+        dest_colors:            Optional[Dict]  = None,
+        intersection_outgoing:  Optional[set]   = None,
+        bbox:                   Optional[Any]   = None,
+
     ):
         if not os.path.isfile(net_file):
             raise FileNotFoundError(
@@ -116,6 +173,12 @@ class SumoEnvironment:
         self.max_steps   = max_steps
         self.port        = port
         self.seed        = seed
+
+        self._image_size            = image_size
+        self._dest_colors           = dest_colors
+        self._intersection_outgoing = intersection_outgoing
+        self._bbox                  = bbox
+
 
         # Resolve SUMO binary
         sumo_home = sumo_home or os.environ.get("SUMO_HOME", "")
@@ -139,6 +202,7 @@ class SumoEnvironment:
         self.state_extractor:     Optional[StateExtractor]     = None
         self.action_handler:      Optional[ActionHandler]       = None
         self.statistics_collector: Optional[StatisticsCollector] = None
+        self.observation_builder:  Optional[ObservationBuilder]  = None
 
         # Flag: start() has been called
         self._started = False
@@ -151,6 +215,7 @@ class SumoEnvironment:
             f"  step_length: {self.step_length}s\n"
             f"  max_steps  : {self.max_steps}\n"
             f"  port       : {self.port}\n"
+            f"  image_size  : {self._image_size}px\n"
         )
 
     def start(self) -> None:
@@ -188,8 +253,10 @@ class SumoEnvironment:
         initial state observation.
 
         Returns :
-            dict
-                The initial state of the simulation (see StateExtractor).
+            observation : dict
+                "image"   -> ndarray (n, n, 3) uint8  -> fed directly to the agent
+                "state"   -> dict                      -> full raw TraCI snapshot
+                "leaders" -> dict {lane_id: vid|None}  -> current lane leaders
 
         Raises :
             RuntimeError
@@ -218,11 +285,29 @@ class SumoEnvironment:
         self.state_extractor      = StateExtractor()
         self.action_handler       = ActionHandler(step_length=self.step_length)
         self.statistics_collector = StatisticsCollector()
+        self.observation_builder  = ObservationBuilder(
+            dest_colors           = self._dest_colors,
+            intersection_outgoing = self._intersection_outgoing,
+            bbox                  = self._bbox,
+        )
+
+        # TODO See if we return the state as before like below or only the image
 
         # Return first observation
-        initial_state = self.create_state()
+        # initial_state = self.create_state()
+
+         
+        obs = self._build_observation()
+        print(
+            f"[SumoEnvironment] reset() complete -> "
+            f"image shape {obs['image'].shape}, "
+            f"{len(obs['leaders'])} lanes tracked."
+        )
+
         print("[SumoEnvironment] reset() complete => simulation started.")
-        return initial_state
+        
+        #return initial_state
+        return obs
 
 
     def step(
@@ -231,72 +316,78 @@ class SumoEnvironment:
         simulation_time: Optional[float] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """
-        Apply an action and advance the simulation by one time step.
-
-        Parameters :
-
-            action : Any
-                Control action to apply to vehicles.  Can be:
-                - None       => no control, vehicles follow SUMO defaults
-                - dict       => {vehicle_id: speed} mapping (speed control)
-                - list       => list of actions to apply via ActionHandler
-
-            simulation_time : float | None
-                If provided, advance the simulation to this absolute time (s),
-                applying the action at every sub-step along the way.
-                If None, advance by exactly one step_length.
-
-        Returns :
-            state : dict
-                New simulation state after the step.
-            info : dict
-                Diagnostic information (step number, simulation time, done flag).
-
-        Raises :
-            RuntimeError
-                If the simulation is not running (call reset() first).
+        Apply an action, advance the simulation by one step.
+ 
+        Parameters
+        ----------
+        action : dict | None
+            Discrete binary dict  {lane_id: 0 | 1}
+                1 -> let the leader of this lane go  (speed restored to -1)
+                0 -> stop the leader of this lane    (speed = 0)
+ 
+            Pass ``None`` for no external control (SUMO runs freely).
+            Legacy ActionHandler formats (speed dict, list of action dicts)
+            are also accepted.
+ 
+        Returns
+        -------
+        observation : dict
+            "image"   -> ndarray (n, n, 3) uint8
+            "state"   -> dict  (raw TraCI snapshot)
+            "leaders" -> dict  {lane_id: vehicle_id | None}
+ 
+        reward : float
+            Number of vehicles that completed their route this step.
+            (Exactly ``traci.simulation.getArrivedNumber()``, the teacher's
+            reference reward.)
+ 
+        done : bool
+            True when the episode should end.
+ 
+        info : dict
+            "step"            -> current step index
+            "simulation_time" -> SUMO clock in seconds
+            "done"            -> same as the done return value
+            "stats"           -> snapshot from statistics()
         """
-        if not self._simulation_running:
-            raise RuntimeError(
-                "Simulation is not running.  Call reset() first."
-            )
-
-        # 1. Advance simulation (action applied inside the loop / before the step)
-        if simulation_time is not None:
-            # Advance to a specific absolute time, applying the action at
-            # every sub-step so control is consistent across the whole interval.
-            while traci.simulation.getTime() < simulation_time:
-                if action is not None:
-                    self.action_handler.set_action(action)
-                traci.simulationStep()
-                self._current_step += 1
-        else:
-            # Single step: apply action once, then advance.
-            if action is not None:
-                self.action_handler.set_action(action)
-            traci.simulationStep()
-            self._current_step += 1
-
-        # 2. Collect new state
-        state = self.create_state()
-
-        # 3. Check termination
+        self._check_running()
+ 
+        # 1. Apply action 
+        if action is not None:
+            self._apply_action(action)
+ 
+        # 2. Advance simulation 
+        traci.simulationStep()
+        self._current_step += 1
+ 
+        # 3. Reward: vehicles that completed their route this step 
+        # Must be read AFTER simulationStep() so the counter is updated.
+        reward = float(traci.simulation.getArrivedNumber())
+        # TODO apply reward with the new system
+        # reward = self.reward_calculator.compute()
+ 
+        # 4. Build observation 
+        obs  = self._build_observation()
         done = self._is_done()
-
+ 
+        # 5. Collect statistics 
+        stats = self.statistics_collector.statistics()
+ 
         info = {
             "step":            self._current_step,
             "simulation_time": traci.simulation.getTime(),
             "done":            done,
+            "stats":           stats,
         }
-
+ 
         if done:
             print(
                 f"[SumoEnvironment] Episode finished at step "
-                f"{self._current_step} "
-                f"(t={info['simulation_time']:.1f}s)."
+                f"{self._current_step} (t={info['simulation_time']:.1f}s)."
             )
+ 
+        return obs, reward, done, info
 
-        return state, info
 
     def close(self) -> None:
         """
@@ -395,6 +486,115 @@ class SumoEnvironment:
 
     # ---- Internal Helpers ----
 
+    def _build_observation(self) -> Dict[str, Any]:
+        """
+        Build the observation dict returned by reset() and step().
+ 
+        Returns
+        -------
+        dict:
+            "image"   -> ndarray (n, n, 3)  - the pixel map fed to the agent
+            "state"   -> dict               - full raw TraCI snapshot
+            "leaders" -> dict               - {lane_id: vehicle_id | None}
+        """
+        raw_state = self.state_extractor.create_state()
+        image     = self.observation_builder.build_image(n=self._image_size)
+        return {
+            "image":   image,
+            "state":   raw_state,
+            "leaders": raw_state["leaders"],
+        }
+ 
+    def _apply_action(self, action: Any) -> None:
+        """
+        Dispatch the action to the correct handler.
+ 
+        Discrete binary  {lane_id: 0|1}   -> _apply_binary_action()
+        Legacy speed     {vid: float}      -> ActionHandler.set_action()
+        Legacy list      [{"vehicle_id":…} -> ActionHandler.set_action()
+ 
+        Extending to continuous actions
+        --------------------------------
+        Add an ``elif`` here that checks for float values > 1 and calls
+        ``self.action_handler._apply_speed(vehicle_id, v)`` directly.
+        """
+        if isinstance(action, dict) and self._looks_binary(action):
+            self._apply_binary_action(action)
+        else:
+            # Legacy path: speed dict or list of action dicts
+            self.action_handler.set_action(action)
+ 
+    def _looks_binary(self, action: dict) -> bool:
+        """Return True if every value in the action dict is 0 or 1."""
+        return all(v in (0, 1, 0.0, 1.0) for v in action.values())
+ 
+    def _apply_binary_action(self, action: Dict[str, int]) -> None:
+        """
+        Apply a discrete {lane_id: 0|1} action to leader vehicles.
+ 
+        Called every step before ``traci.simulationStep()``.
+ 
+        For each lane present in the action dict:
+            1 -> restore SUMO's car-following model  (speed = -1)
+            0 -> force the vehicle to stop           (speed = 0)
+ 
+        Lanes absent from the action dict are left unchanged.
+        """
+        leaders = self.state_extractor.get_leaders()
+ 
+        for lane_id, go in action.items():
+            vehicle_id = leaders.get(lane_id)
+            if vehicle_id is None:
+                continue   # lane is empty — nothing to do
+ 
+            if go:
+                self.action_handler._reset_vehicle(vehicle_id)
+            else:
+                self.action_handler._apply_speed(vehicle_id, 0.0)
+
+
+    def _is_done(self) -> bool:
+        """
+        Return True when the episode should end.
+        Conditions:
+          - max_steps reached
+          - no more vehicles in the network AND simulation time > 60s
+            (allow some warm-up time before declaring done)
+        """
+        if self._current_step >= self.max_steps:
+            return True
+        sim_time = traci.simulation.getTime()
+        if sim_time > 60 and traci.simulation.getMinExpectedNumber() == 0:
+            return True
+        return False
+
+    def _close_traci(self) -> None:
+        """Disconnect TraCI and set the running flag to False."""
+        try:
+            traci.close()
+        except Exception:
+            pass   # ignore errors during cleanup
+        self._simulation_running = False
+        print("[SumoEnvironment] TraCI connection closed.")
+
+    def _check_running(self) -> None:
+        """Raise RuntimeError if the simulation is not active."""
+        if not self._simulation_running:
+            raise RuntimeError(
+                "No simulation running.  Call reset() first."
+            )
+
+    def _sumo_bin_exists(self) -> bool:
+        """Check whether the SUMO binary is reachable."""
+        # If it is an absolute path, check directly
+        if os.path.isabs(self._sumo_bin):
+            return os.path.isfile(self._sumo_bin)
+        # Otherwise, check if it is on the system PATH
+        import shutil
+        return shutil.which(self._sumo_bin) is not None
+
+
+
     def _write_sumocfg(self) -> str:
         """
         Write a .sumocfg configuration file next to the net file and return
@@ -457,43 +657,3 @@ class SumoEnvironment:
         if self.use_gui:
             cmd += ["--start", "--quit-on-end"]
         return cmd
-
-    def _is_done(self) -> bool:
-        """
-        Return True when the episode should end.
-        Conditions:
-          - max_steps reached
-          - no more vehicles in the network AND simulation time > 60s
-            (allow some warm-up time before declaring done)
-        """
-        if self._current_step >= self.max_steps:
-            return True
-        sim_time = traci.simulation.getTime()
-        if sim_time > 60 and traci.simulation.getMinExpectedNumber() == 0:
-            return True
-        return False
-
-    def _close_traci(self) -> None:
-        """Disconnect TraCI and set the running flag to False."""
-        try:
-            traci.close()
-        except Exception:
-            pass   # ignore errors during cleanup
-        self._simulation_running = False
-        print("[SumoEnvironment] TraCI connection closed.")
-
-    def _check_running(self) -> None:
-        """Raise RuntimeError if the simulation is not active."""
-        if not self._simulation_running:
-            raise RuntimeError(
-                "No simulation running.  Call reset() first."
-            )
-
-    def _sumo_bin_exists(self) -> bool:
-        """Check whether the SUMO binary is reachable."""
-        # If it is an absolute path, check directly
-        if os.path.isabs(self._sumo_bin):
-            return os.path.isfile(self._sumo_bin)
-        # Otherwise, check if it is on the system PATH
-        import shutil
-        return shutil.which(self._sumo_bin) is not None
