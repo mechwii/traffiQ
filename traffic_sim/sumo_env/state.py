@@ -12,16 +12,16 @@ Implements the two state-related functions from the specification:
 TraCI calls used :
 
   traci.vehicle.getIDList()          - all active vehicle IDs
-  traci.vehicle.getSpeed()           — speed in m/s
-  traci.vehicle.getPosition()        — (x, y) in metres
-  traci.vehicle.getRoadID()          — current edge ID
-  traci.vehicle.getAccumulatedWaitingTime() — total waiting time in s
-  traci.vehicle.getLaneID()          — current lane ID
-  traci.vehicle.getLeader()          — (leader_id, gap) ahead in same lane
-  traci.edge.getLastStepOccupancy()  — lane occupancy 0–100 %
-  traci.edge.getLastStepMeanSpeed()  — mean speed of last step (m/s)
-  traci.lane.getIDList()             — all lane IDs in the network
-  traci.simulation.getTime()         — current simulation clock
+  traci.vehicle.getSpeed()           - speed in m/s
+  traci.vehicle.getPosition()        - (x, y) in metres
+  traci.vehicle.getRoadID()          - current edge ID
+  traci.vehicle.getAccumulatedWaitingTime() - total waiting time in s
+  traci.vehicle.getLaneID()          - current lane ID
+  traci.vehicle.getLeader()          - (leader_id, gap) ahead in same lane
+  traci.edge.getLastStepOccupancy()  - lane occupancy 0–100 %
+  traci.edge.getLastStepMeanSpeed()  - mean speed of last step (m/s)
+  traci.lane.getIDList()             - all lane IDs in the network
+  traci.simulation.getTime()         - current simulation clock
 
   """
 

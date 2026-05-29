@@ -98,11 +98,11 @@ def _parse_net_edges(net_file: str) -> Tuple[List[str], List[str]]:
         id starts with ':' => we always skip both.
  
     Dead-end border nodes have type="dead_end" in the compiled file,
-    exactly as we set in the .nod.xml — netconvert preserves this.
+    exactly as we set in the .nod.xml - netconvert preserves this.
 
     Returns :
       entry_edges : list[str]
-          Edges whose 'from' node is a dead_end (border) node — these are
+          Edges whose 'from' node is a dead_end (border) node - these are
           the edges on which vehicles enter the network.
       all_edges : list[str]
         All non-internal road edges (entry + internal road segments).

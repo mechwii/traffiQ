@@ -19,12 +19,12 @@ Episode history :
     The collector keeps a per-step log that can be exported to a pandas DataFrame for analysis and plotting.
 
 TraCI calls used :
-    traci.vehicle.getIDList()               — active vehicles
-    traci.vehicle.getSpeed(vid)             — current speed
-    traci.vehicle.getAccumulatedWaitingTime(vid) — waiting time
-    traci.simulation.getTime()             — simulation clock
-    traci.simulation.getArrivedNumber()    — vehicles that finished this step
-    traci.simulation.getDepartedNumber()   — vehicles that entered this step
+    traci.vehicle.getIDList()               - active vehicles
+    traci.vehicle.getSpeed(vid)             - current speed
+    traci.vehicle.getAccumulatedWaitingTime(vid) - waiting time
+    traci.simulation.getTime()             - simulation clock
+    traci.simulation.getArrivedNumber()    - vehicles that finished this step
+    traci.simulation.getDepartedNumber()   - vehicles that entered this step
 """
 
 from typing import Any, Dict, List, Optional
@@ -151,7 +151,7 @@ class StatisticsCollector:
 
         # Compute travel times for vehicles that completed their trip this step.
         # getArrivedIDList() returns every vehicle that reached its destination
-        # during this simulation step — this is the correct TraCI call (was
+        # during this simulation step - this is the correct TraCI call (was
         # previously missing, which caused mean_travel_time to always be 0.0).
         for vid in traci.simulation.getArrivedIDList():
             if vid in self._departure_times:
@@ -207,7 +207,7 @@ class StatisticsCollector:
             dict with overall episode-level metrics.
         """
         if not self._history:
-            return {"error": "No data collected — call statistics() first."}
+            return {"error": "No data collected - call statistics() first."}
 
         all_speeds  = [h["mean_speed"]       for h in self._history]
         all_waits   = [h["mean_waiting_time"] for h in self._history]

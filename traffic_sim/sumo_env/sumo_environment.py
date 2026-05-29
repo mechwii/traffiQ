@@ -545,7 +545,7 @@ class SumoEnvironment:
         for lane_id, go in action.items():
             vehicle_id = leaders.get(lane_id)
             if vehicle_id is None:
-                continue   # lane is empty — nothing to do
+                continue   # lane is empty - nothing to do
  
             if go:
                 self.action_handler._reset_vehicle(vehicle_id)
@@ -624,12 +624,12 @@ class SumoEnvironment:
         tim = ET.SubElement(config, "time")
         ET.SubElement(tim, "step-length", attrib={"value": str(self.step_length)})
 
-        # <report> block — suppress noisy console output
+        # <report> block - suppress noisy console output
         rep = ET.SubElement(config, "report")
         ET.SubElement(rep, "no-warnings",  attrib={"value": "true"})
         ET.SubElement(rep, "no-step-log",  attrib={"value": "true"})
 
-        # <processing> block — realistic unsignalized intersection behaviour
+        # <processing> block - realistic unsignalized intersection behaviour
         proc = ET.SubElement(config, "processing")
         ET.SubElement(proc, "time-to-teleport",      attrib={"value": "-1"})
         ET.SubElement(proc, "waiting-time-memory",   attrib={"value": "10000"})

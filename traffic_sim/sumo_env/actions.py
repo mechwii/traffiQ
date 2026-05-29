@@ -122,11 +122,11 @@ class ActionHandler:
                 else:
                     print(
                        f"[ActionHandler] Unknown action type: '{action_type}' "
-                       f"for vehicle '{vehicle_id}' — skipped."
+                       f"for vehicle '{vehicle_id}' - skipped."
                     )
             return  
         print(
-            f"[ActionHandler] Unrecognised action format: {type(actions)} — "
+            f"[ActionHandler] Unrecognised action format: {type(actions)} - "
             "no actions applied."
         )
 
@@ -149,9 +149,9 @@ class ActionHandler:
           Bit 4 (value 16): Brake hard at red lights / stop lines
 
         Common presets:
-          31  (binary 11111) — default: all checks active
-           0  (binary 00000) — full external control: no SUMO checks
-          22  (binary 10110) — disable safe-speed and right-of-way
+          31  (binary 11111) - default: all checks active
+           0  (binary 00000) - full external control: no SUMO checks
+          22  (binary 10110) - disable safe-speed and right-of-way
                                (useful for RL agents that set precise speeds)
         
         Parameters :
