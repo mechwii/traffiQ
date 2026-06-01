@@ -27,6 +27,9 @@ class AgentCallManager:
         self._prev_leaders:    Dict[str, Optional[str]] = {}
         # lane_id -> 0|1  last decision
         self._current_action:  Dict[str, int]           = {}
+
+        # To avoid the simulation block on a step
+        self._steps_since_last_call: int = 0
  
     def needs_new_decision(
         self,
@@ -41,6 +44,12 @@ class AgentCallManager:
         2. A lane that had a vehicle the agent allowed to GO now has a
            DIFFERENT vehicle (the old one crossed; new one needs a decision).
         """
+        self._steps_since_last_call += 1 
+
+        # Condition 0: Security anti blocking (each 15 secondes)
+        if self._steps_since_last_call >= 15:
+            return True
+        
         for lane_id, vid in current_leaders.items():
             prev_vid    = self._prev_leaders.get(lane_id)
             prev_action = self._current_action.get(lane_id, 0)
@@ -62,6 +71,7 @@ class AgentCallManager:
         action:         Dict[str, int],
     ) -> None:
         """Record the leaders and action decided this step."""
+        self.reset_step_since_last_call()
         self._prev_leaders   = dict(leaders)
         self._current_action = dict(action)
  
@@ -69,7 +79,11 @@ class AgentCallManager:
         """Return the last decided action (held between re-triggers)."""
         return dict(self._current_action)
  
+    def reset_step_since_last_call(self):
+        self._steps_since_last_call = 0
+
     def reset(self) -> None:
         """Clear state at the start of a new episode."""
         self._prev_leaders.clear()
         self._current_action.clear()
+        self._steps_since_last_call = 0
