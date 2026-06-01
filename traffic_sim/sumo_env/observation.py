@@ -4,27 +4,37 @@ ObservationBuilder
 ==================
 Converts the running SUMO simulation into the RGB image observation
 that is sent to the AI agent every step.
- 
+
 The image mirrors ``image_construct1()`` from the teacher's reference:
- 
+
     - Shape    : (n x n x 3)  uint8  ndarray
     - One pixel per vehicle currently in the network.
     - Intensity -> current speed   (dim = stopped, bright = fast).
     - Colour    -> outgoing edge / intended direction at the intersection.
     - White     -> vehicle already past the intersection (arrived / clearing).
- 
-build_image_for_intersection()
---------------------------------------
-For multi-intersection networks, each agent should see only its own
-intersection's region rather than the whole network crammed into 50×50 pixels.
- 
-``build_image_for_intersection(intersection_id, n)`` crops the world
-bounding box to the region around that intersection's incoming edges,
-then renders only the vehicles in that region into an n×n image.
- 
-The crop boundaries are derived at runtime from the lane geometry stored in
-TraCI, so no manual coordinates need to be specifie
- 
+
+Color scheme (consistent for ALL network types)
+-----------------------------------------------
+The dest_colors table maps EXIT edge IDs to RGB colors.  For single-
+intersection networks these are "C_to_N", "C_to_E" etc.  For multi-
+intersection networks the exits are "J0_to_N0", "J_0_0_to_N_0_0" etc.
+
+Rather than maintaining a static table that breaks on new topologies,
+_normalize_dest_edge() does a two-step lookup:
+  1. Direct match / prefix match against self.dest_colors (fast path, works
+     for any user-supplied table and for the default "C_to_*" single-int table).
+  2. Fallback: parse the DESTINATION NODE of the edge ("C_to_E" -> "E",
+     "J0_to_N0" -> "N0", "J_0_0_to_N_0_0" -> "N_0_0") and map its FIRST
+     LETTER to a canonical dest_colors key ("N"->"C_to_N" etc.).
+     This covers multi-intersection exits without any extra configuration.
+
+Outgoing-edge detection (vehicles drawn white)
+----------------------------------------------
+intersection_outgoing is the user-supplied set of outgoing edge IDs.
+For multi-intersection networks we additionally test whether the CURRENT
+EDGE name ends with a border-node suffix (N*, S*, E*, W*) after the last
+"_to_".  This is done inside _is_outgoing() so no static set is needed.
+
 TraCI calls used
 ----------------
     traci.vehicle.getIDList()
@@ -34,234 +44,120 @@ TraCI calls used
     traci.vehicle.getRoadID(vid)
     traci.vehicle.getLaneID(vid)
     traci.simulation.getNetBoundary()
+    traci.junction.getPosition(jid)   <- for crop bbox
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Set, Tuple
- 
+from typing import Dict, Optional, Set, Tuple
+
 import numpy as np
- 
+
 try:
     import traci
     TRACI_AVAILABLE = True
 except ImportError:
     TRACI_AVAILABLE = False
 
-MAX_SPEED_MS = 14.0   # m/s -> used for pixel intensity normalisation
+MAX_SPEED_MS   = 14.0   # m/s -> pixel intensity normalisation
+_CROP_RADIUS_M = 110.0  # metres around junction centre for cropped image
 
-# Extra padding (metres) added around each intersection's crop region so that
-# vehicles that are close to but not yet on the intersection edge are visible.
-_CROP_PADDING_M = 20.0
+# Canonical single-intersection dest_colors keys, one per direction letter
+_DIRECTION_TO_COLOR_KEY: Dict[str, str] = {
+    "N": "C_to_N",
+    "S": "C_to_S",
+    "E": "C_to_E",
+    "W": "C_to_W",
+}
+
 
 class ObservationBuilder:
     """
     Builds the RGB image observation from the running SUMO simulation.
- 
+
     Parameters
     ----------
     dest_colors : dict {edge_id: (R, G, B)} | None
-        Maps outgoing edge IDs to an (R, G, B) colour in [0.0, 1.0].
-        Vehicles heading toward that exit are drawn in this colour.
-        If None, the default table matching the teacher's reference is used.
- 
-        To match YOUR network, pass this from ``SumoEnvironment.__init__``:
-            dest_colors = {
-                "C_to_N": (1.0, 0.0, 0.0),   # red    -> north exit
-                "C_to_S": (0.0, 1.0, 0.0),   # green  -> south exit
-                "C_to_E": (0.0, 0.0, 1.0),   # blue   -> east exit
-                "C_to_W": (1.0, 1.0, 0.0),   # yellow -> west exit
-            }
- 
+        Color table for destination edges.  Default covers all single-
+        intersection types (four_way, t_junction, complex).
     intersection_outgoing : set[str] | None
-        Edge IDs that are *outgoing* from the main intersection.
-        Vehicles already on one of these edges are drawn **white**
-        (they have cleared the intersection).
-        If None, the default set from the teacher's reference is used.
- 
-        To match YOUR network:
-            intersection_outgoing = {"C_to_N", "C_to_S", "C_to_E", "C_to_W"}
- 
-    bbox : ((xmin, ymin), (xmax, ymax)) | None
-        World-coordinate bounding box for the image.
-        If None, the full network boundary is queried from TraCI at runtime.
+        Edge IDs drawn white (vehicle has cleared the intersection).
+        Multi-intersection outgoing edges are detected automatically.
+    bbox : ((xmin,ymin),(xmax,ymax)) | None
+        Fixed world bounding box for build_image().
     """
 
-    # --------- Default color / outgoing tables ---------    
-    
-    """
     _DEFAULT_DEST_COLORS: Dict[str, Tuple[float, float, float]] = {
-        "1to2": (1.0, 0.0, 0.0),   # red
-        "1to6": (0.0, 1.0, 0.0),   # green
-        "1to3": (0.0, 0.0, 1.0),   # blue
-        "1to5": (1.0, 1.0, 0.0),   # yellow
-    }
-
-    _DEFAULT_OUTGOING: set = {"1to5", "1to3", "1to2", "1to6"}
-    """
-
-    # Be aware here cause depending on the configuration this might change so we have to give
-    # a configuration for each config that we generate, here is a universal list, but not enough
-    # Cause for many lanes we will have number in the name
-    _DEFAULT_DEST_COLORS: Dict[str, Tuple[float, float, float]] = {
-        "C_to_N":  (1.0, 0.0, 0.0),  # red   -> North (four_way, t_junction)
-        "C_to_S":  (0.0, 1.0, 0.0),  # green    -> South (four_way, complex)
-        "C_to_E":  (0.0, 0.0, 1.0),  # blue    -> East (tous)
-        "C_to_W":  (1.0, 1.0, 0.0),  # yellow   -> West (tous)
-        "C_to_NE": (0.0, 1.0, 1.0),  # cyan    -> North-East (complex)
-        "C_to_NW": (1.0, 0.0, 1.0),  # magenta -> North-west (complex)
+        "C_to_N":  (1.0, 0.0, 0.0),   # red
+        "C_to_S":  (0.0, 1.0, 0.0),   # green
+        "C_to_E":  (0.0, 0.0, 1.0),   # blue
+        "C_to_W":  (1.0, 1.0, 0.0),   # yellow
+        "C_to_NE": (0.0, 1.0, 1.0),   # cyan
+        "C_to_NW": (1.0, 0.0, 1.0),   # magenta
     }
 
     _DEFAULT_OUTGOING: set = {
         "C_to_N", "C_to_S", "C_to_E", "C_to_W", "C_to_NE", "C_to_NW"
     }
- 
+
     def __init__(
         self,
-        dest_colors:            Optional[Dict[str, Tuple[float, float, float]]] = None,
-        intersection_outgoing:  Optional[set]   = None,
-        bbox:                   Optional[Tuple]  = None,
+        dest_colors:           Optional[Dict[str, Tuple[float, float, float]]] = None,
+        intersection_outgoing: Optional[set]  = None,
+        bbox:                  Optional[Tuple] = None,
     ):
         self.dest_colors           = dest_colors           or self._DEFAULT_DEST_COLORS
         self.intersection_outgoing = intersection_outgoing or self._DEFAULT_OUTGOING
-        self._bbox                 = bbox   # None -> queried from TraCI at runtime
+        self._bbox                 = bbox
 
-        # Cache: intersection_id -> crop bbox computed once per episode
+        # Cache: intersection_id -> (xmin, ymin, xmax, ymax)
         self._intersection_bboxes: Dict[int, Tuple[float, float, float, float]] = {}
 
+    # ------------------------------------------------------------------ #
+    #  Public: full-network image                                          #
+    # ------------------------------------------------------------------ #
 
-    # --------- PUBLIC : full-network image  ---------    
     def build_image(self, n: int = 50) -> np.ndarray:
-        """
-        Build the (n x n x 3) uint8 RGB image sent to the AI agent.
-  
-        Parameters
-        ----------
-        n : int
-            Image side length in pixels.  Default 50.
- 
-        Returns
-        -------
-        image : ndarray, shape (n, n, 3), dtype uint8
-        """
+        """Build an n×n RGB image of the full network."""
         (xmin, ymin), (xmax, ymax) = self._get_bbox()
         return self._render(xmin, ymin, xmax, ymax, n)
-        """ OLD WAY (BEFORE CROPPING IMAGE PER INTERSECTIONS)
-        image = np.zeros((n, n, 3), dtype=np.uint8)
- 
-        (xmin, ymin), (xmax, ymax) = self._get_bbox()
 
-        # We protect from the division by 0
-        dx = max(1e-6, xmax - xmin)
-        dy = max(1e-6, ymax - ymin)
- 
-        for vid in traci.vehicle.getIDList():
-            x, y = traci.vehicle.getPosition(vid)
- 
-            # Skip vehicles outside the bounding box
-            if not (xmin <= x <= xmax and ymin <= y <= ymax):
-                continue
- 
-            px, py = self._world_to_pixel(x, y, xmin, xmax, ymin, ymax, dx, dy, n)
-            if not (0 <= px < n and 0 <= py < n):
-                continue
- 
-            speed     = traci.vehicle.getSpeed(vid)
-            intensity = self._speed_to_intensity(speed)
- 
-            # Build a clean route (strip SUMO internal edges starting with ':')
-            route       = traci.vehicle.getRoute(vid) or []
-            route_clean = [e for e in route if not e.startswith(":")]
- 
-            # Grey pixel when the route has no meaningful edge
-            if not route_clean:
-                image[py, px] = (intensity, intensity, intensity)
-                continue
- 
-            # Find the first route edge that maps to a configured destination.
-            # This supports exact edge IDs like "C_to_N" and lane-specific
-            # variants such as "C_to_N_0" or "C_to_NE_1".
-            edge_for_color = None
-            for e in route_clean:
-                edge_for_color = self._normalize_dest_edge(e)
-                if edge_for_color is not None:
-                    break
-            if edge_for_color is None:
-                edge_for_color = self._normalize_dest_edge(route_clean[-1]) or route_clean[-1]
- 
-            # Resolve current edge (SUMO internal edges start with ':')
-            road_id = traci.vehicle.getRoadID(vid)
-            if road_id.startswith(":"):
-                lane_id   = traci.vehicle.getLaneID(vid)
-                curr_edge = lane_id.split("_")[0] if lane_id else road_id
-            else:
-                curr_edge = road_id
- 
-            # Vehicles that have already cleared the intersection -> white
-            if curr_edge in self.intersection_outgoing:
-                image[py, px] = (255, 255, 255)
-            elif edge_for_color in self.dest_colors:
-                cr, cg, cb = self.dest_colors[edge_for_color]
-                image[py, px] = (
-                    int(cr * intensity),
-                    int(cg * intensity),
-                    int(cb * intensity),
-                )
-            else:
-                # Unknown destination → grey
-                image[py, px] = (intensity, intensity, intensity)
- 
-        return image
-        """
-    
-    # --------- PUBLIC : per-intersection cropped image ---------    
+    # ------------------------------------------------------------------ #
+    #  Public: per-intersection cropped image                              #
+    # ------------------------------------------------------------------ #
 
     def build_image_for_intersection(
         self,
         intersection_id: int,
-        incoming_lane_ids: List[str],
+        junction_id: str,
         n: int = 50,
     ) -> np.ndarray:
         """
-        Build an n x n image cropped to a single intersection's region.
- 
-        The crop bounding box is derived from the world coordinates of the
-        ``incoming_lane_ids`` (the lanes feeding into this intersection).
-        A padding of ``_CROP_PADDING_M`` metres is added on all sides.
- 
-        On the first call for a given intersection_id the bbox is computed
-        and cached.  Subsequent calls reuse the cache.
- 
+        Build an n×n image cropped to one intersection's region.
+
+        Bbox is centred on the junction's world position with radius
+        _CROP_RADIUS_M metres.  Computed once per episode and cached.
+
         Parameters
         ----------
-        intersection_id : int
-            Index of the intersection (0-based).
-        incoming_lane_ids : list[str]
-            All lane IDs that feed into this intersection.
-            Typically the keys of the per-intersection leaders dict.
-        n : int
-            Output image side length in pixels.  Default 50.
- 
-        Returns
-        -------
-        ndarray, shape (n, n, 3), dtype uint8
+        intersection_id : int   cache key
+        junction_id     : str   SUMO node ID ("C", "J0", "J_0_1", …)
+        n               : int   output side length in pixels
         """
         if intersection_id not in self._intersection_bboxes:
-            bbox = self._compute_intersection_bbox(incoming_lane_ids)
-            self._intersection_bboxes[intersection_id] = bbox
- 
+            self._intersection_bboxes[intersection_id] = (
+                self._bbox_from_junction(junction_id)
+            )
         xmin, ymin, xmax, ymax = self._intersection_bboxes[intersection_id]
         return self._render(xmin, ymin, xmax, ymax, n)
- 
+
     def reset_bbox_cache(self) -> None:
-        """
-        Clear the cached intersection bounding boxes.
-        Call this at the start of each episode (after env.reset()) so that
-        new lane geometries are picked up correctly.
-        """
+        """Clear per-episode bbox cache.  Call after env.reset()."""
         self._intersection_bboxes.clear()
 
-    # --------- Internal rendering engine ---------
+    # ------------------------------------------------------------------ #
+    #  Core rendering engine                                               #
+    # ------------------------------------------------------------------ #
 
     def _render(
         self,
@@ -270,57 +166,68 @@ class ObservationBuilder:
         n: int,
     ) -> np.ndarray:
         """
-        Render all vehicles inside the bounding box into an n x n image.
-        This is the shared core used by both build_image() and
-        build_image_for_intersection().
+        Render all vehicles inside the bounding box into an n×n RGB image.
+
+        Per vehicle:
+          - outgoing edge  -> white  (already cleared intersection)
+          - known dest     -> dest color × speed intensity
+          - unknown dest   -> grey
         """
         image = np.zeros((n, n, 3), dtype=np.uint8)
- 
-        dx = max(1e-6, xmax - xmin)
-        dy = max(1e-6, ymax - ymin)
- 
+        dx    = max(1e-6, xmax - xmin)
+        dy    = max(1e-6, ymax - ymin)
+
         for vid in traci.vehicle.getIDList():
             x, y = traci.vehicle.getPosition(vid)
- 
             if not (xmin <= x <= xmax and ymin <= y <= ymax):
                 continue
- 
+
             px, py = self._world_to_pixel(x, y, xmin, xmax, ymin, ymax, dx, dy, n)
             if not (0 <= px < n and 0 <= py < n):
                 continue
- 
+
             speed     = traci.vehicle.getSpeed(vid)
             intensity = self._speed_to_intensity(speed)
- 
+
+            # ---- Resolve current edge ----
+            # SUMO internal edges start with ':' — in that case read the
+            # actual edge from the lane ID by stripping the lane index.
+            road_id = traci.vehicle.getRoadID(vid)
+            if road_id.startswith(":"):
+                lane_id   = traci.vehicle.getLaneID(vid)
+                # Lane ID format: "<edge_id>_<lane_index>"
+                # Strip the last "_<digit>" to get the edge ID.
+                # e.g. "C_to_N_0" -> "C_to_N",  "J0_to_N0_1" -> "J0_to_N0"
+                parts     = lane_id.rsplit("_", 1)
+                curr_edge = parts[0] if len(parts) == 2 and parts[1].isdigit() else lane_id
+            else:
+                curr_edge = road_id
+
+            # ---- White: already past the intersection ----
+            if self._is_outgoing(curr_edge):
+                image[py, px] = (255, 255, 255)
+                continue
+
+            # ---- Color: find destination from route ----
             route       = traci.vehicle.getRoute(vid) or []
             route_clean = [e for e in route if not e.startswith(":")]
- 
+
             if not route_clean:
                 image[py, px] = (intensity, intensity, intensity)
                 continue
- 
-            # Find the first route edge that maps to a known destination
+
+            # Search route edges for a recognisable color key
             edge_for_color = None
             for e in route_clean:
                 edge_for_color = self._normalize_dest_edge(e)
                 if edge_for_color is not None:
                     break
+
             if edge_for_color is None:
-                edge_for_color = (
-                    self._normalize_dest_edge(route_clean[-1]) or route_clean[-1]
-                )
- 
-            # Resolve current edge
-            road_id = traci.vehicle.getRoadID(vid)
-            if road_id.startswith(":"):
-                lane_id  = traci.vehicle.getLaneID(vid)
-                curr_edge = lane_id.split("_")[0] if lane_id else road_id
-            else:
-                curr_edge = road_id
- 
-            if curr_edge in self.intersection_outgoing:
-                image[py, px] = (255, 255, 255)
-            elif edge_for_color in self.dest_colors:
+                # Last resort: try the last edge in the route
+                edge_for_color = self._normalize_dest_edge(route_clean[-1])
+
+            if edge_for_color is not None and edge_for_color in self.dest_colors:
                 cr, cg, cb = self.dest_colors[edge_for_color]
                 image[py, px] = (
                     int(cr * intensity),
@@ -329,71 +236,110 @@ class ObservationBuilder:
                 )
             else:
                 image[py, px] = (intensity, intensity, intensity)
- 
-        return image    
-    
-    # ---- Internal crop bbox computation ----
-    def _compute_intersection_bbox(
-        self,
-        incoming_lane_ids: List[str],
-    ) -> Tuple[float, float, float, float]:
-        """
-        Compute the world bounding box that covers all incoming lanes
-        for one intersection, extended by _CROP_PADDING_M on every side.
- 
-        Uses ``traci.lane.getShape(lane_id)`` which returns a list of
-        (x, y) polyline points for the lane's centre line.
- 
-        Falls back to the full network boundary if no lane shapes are found.
-        """
-        all_x: List[float] = []
-        all_y: List[float] = []
- 
-        for lane_id in incoming_lane_ids:
-            try:
-                shape = traci.lane.getShape(lane_id)  # [(x0,y0), (x1,y1), ...]
-                for x, y in shape:
-                    all_x.append(x)
-                    all_y.append(y)
-            except Exception:
-                pass  # lane might be internal / not available
- 
-        if not all_x:
-            # Fallback: full network bbox
-            (xmin, ymin), (xmax, ymax) = traci.simulation.getNetBoundary()
-            return xmin, ymin, xmax, ymax
- 
-        xmin = min(all_x) - _CROP_PADDING_M
-        ymin = min(all_y) - _CROP_PADDING_M
-        xmax = max(all_x) + _CROP_PADDING_M
-        ymax = max(all_y) + _CROP_PADDING_M
-        return xmin, ymin, xmax, ymax
 
+        return image
 
-    # ---- Internal Helpers ----
+    # ------------------------------------------------------------------ #
+    #  Outgoing-edge detection                                             #
+    # ------------------------------------------------------------------ #
+
+    def _is_outgoing(self, edge_id: str) -> bool:
+        """
+        Return True if edge_id is an outgoing edge (vehicle has cleared
+        the intersection and is heading toward a border node).
+
+        Two tests — either one is sufficient:
+          1. edge_id is in self.intersection_outgoing  (user-supplied or
+             the default "C_to_*" set for single intersections).
+          2. The destination node in the edge name starts with a border
+             letter (N, S, E, W).  This covers multi-intersection exits:
+               "J0_to_N0"       -> dest "N0" -> starts with N -> outgoing
+               "J_0_0_to_S_0_0" -> dest "S_0_0" -> starts with S -> outgoing
+             It also handles "C_to_N", "C_to_NE", "C_to_NW" automatically.
+        """
+        if edge_id in self.intersection_outgoing:
+            return True
+
+        # Dynamic detection: edge goes toward a border node
+        if "_to_" in edge_id:
+            dest_node = edge_id.split("_to_")[-1]
+            if dest_node and dest_node[0] in ("N", "S", "E", "W"):
+                return True
+
+        return False
+
+    # ------------------------------------------------------------------ #
+    #  Color key normalisation                                             #
+    # ------------------------------------------------------------------ #
 
     def _normalize_dest_edge(self, edge_id: str) -> Optional[str]:
-        """Map a route edge ID to a configured destination color key."""
+        """
+        Map any route edge ID to a key that exists in self.dest_colors.
+
+        Step 1 — exact match or prefix match (works for single-intersection
+                  edge names like "C_to_N", "C_to_NE", and lane variants
+                  like "C_to_N_0"):
+            "C_to_N"    -> "C_to_N"
+            "C_to_NE_0" -> "C_to_NE"
+
+        Step 2 — destination-node fallback (works for multi-intersection):
+            "J0_to_N0"       -> dest_node "N0" -> first letter "N" -> "C_to_N"
+            "J_0_0_to_S_1_2" -> dest_node "S_1_2" -> first letter "S" -> "C_to_S"
+            "J0_to_J1"       -> dest_node "J1" -> first letter "J" -> None
+                                 (internal road, not a border edge — skip)
+
+        Returns the matched dest_colors key, or None if no match.
+        """
+        # Step 1: direct / prefix match against the configured color table
         if edge_id in self.dest_colors:
             return edge_id
         for dest_key in self.dest_colors:
-            if edge_id == dest_key or edge_id.startswith(f"{dest_key}_"):
+            if edge_id.startswith(f"{dest_key}_"):
                 return dest_key
+
+        # Step 2: destination-node heuristic for multi-intersection exits
+        if "_to_" in edge_id:
+            dest_node = edge_id.split("_to_")[-1]
+            first_letter = dest_node[0] if dest_node else ""
+            color_key = _DIRECTION_TO_COLOR_KEY.get(first_letter)
+            # Only return it if that key actually exists in our color table
+            if color_key is not None and color_key in self.dest_colors:
+                return color_key
+
         return None
- 
+
+    # ------------------------------------------------------------------ #
+    #  Bbox helpers                                                        #
+    # ------------------------------------------------------------------ #
+
+    def _bbox_from_junction(
+        self, junction_id: str
+    ) -> Tuple[float, float, float, float]:
+        """Square bbox centred on junction_id ± _CROP_RADIUS_M metres."""
+        try:
+            jx, jy = traci.junction.getPosition(junction_id)
+            r = _CROP_RADIUS_M
+            return jx - r, jy - r, jx + r, jy + r
+        except Exception:
+            (xmin, ymin), (xmax, ymax) = traci.simulation.getNetBoundary()
+            return xmin, ymin, xmax, ymax
+
     def _get_bbox(self) -> Tuple[Tuple[float, float], Tuple[float, float]]:
-        """Return the full-network bounding box."""
         if self._bbox is not None:
             return self._bbox
         (xmin, ymin), (xmax, ymax) = traci.simulation.getNetBoundary()
         return (xmin, ymin), (xmax, ymax)
- 
+
+    # ------------------------------------------------------------------ #
+    #  Static pixel helpers                                                #
+    # ------------------------------------------------------------------ #
+
     @staticmethod
     def _speed_to_intensity(v: float, v_max: float = MAX_SPEED_MS) -> int:
         """Map speed [0, v_max] to pixel intensity [40, 255]."""
         v = max(0.0, v)
         return int(np.clip(40 + round(215 * (v / max(v_max, 1e-6))), 0, 255))
- 
+
     @staticmethod
     def _world_to_pixel(
         x: float, y: float,
@@ -402,12 +348,7 @@ class ObservationBuilder:
         dx: float,   dy: float,
         n: int,
     ) -> Tuple[int, int]:
-        """Convert world (x, y) -> image pixel (px, py). Origin = top-left."""
+        """World (x, y) -> image pixel (px, py).  Origin = top-left."""
         px = int(round((x - xmin) / dx * (n - 1)))
-        py = int(round((ymax - y) / dy * (n - 1)))  # y-axis inverted
+        py = int(round((ymax - y) / dy * (n - 1)))
         return px, py
-
-
-
-
-
