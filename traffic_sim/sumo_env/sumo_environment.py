@@ -537,16 +537,11 @@ class SumoEnvironment:
             1 -> restore SUMO's car-following model  (speed = -1)
             0 -> force the vehicle to stop           (speed = 0)
  
-        All non-leader vehicles are stopped via set_loaded_veh() so that
-        only leaders receive the go/stop decision.
 
         Lanes absent from the action dict are left unchanged.
         """
         leaders = self.state_extractor.get_leaders()
 
-        # Stop all non-leader vehicles first (spec: set_loaded_veh)
-        self.action_handler.set_loaded_veh(leaders)
- 
         for lane_id, go in action.items():
             vehicle_id = leaders.get(lane_id)
             if vehicle_id is None:
