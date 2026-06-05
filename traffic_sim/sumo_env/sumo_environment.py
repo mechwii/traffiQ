@@ -363,8 +363,7 @@ class SumoEnvironment:
         # 3. Reward: vehicles that completed their route this step 
         # Must be read AFTER simulationStep() so the counter is updated.
         reward = float(traci.simulation.getArrivedNumber())
-        # TODO apply reward with the new system
-        # reward = self.reward_calculator.compute()
+        print(f"[Reward] step={self._current_step} | arrived={reward:.0f}")
  
         # 4. Build observation 
         obs  = self._build_observation()
@@ -538,9 +537,15 @@ class SumoEnvironment:
             1 -> restore SUMO's car-following model  (speed = -1)
             0 -> force the vehicle to stop           (speed = 0)
  
+        All non-leader vehicles are stopped via set_loaded_veh() so that
+        only leaders receive the go/stop decision.
+
         Lanes absent from the action dict are left unchanged.
         """
         leaders = self.state_extractor.get_leaders()
+
+        # Stop all non-leader vehicles first (spec: set_loaded_veh)
+        self.action_handler.set_loaded_veh(leaders)
  
         for lane_id, go in action.items():
             vehicle_id = leaders.get(lane_id)
