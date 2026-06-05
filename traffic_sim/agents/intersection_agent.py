@@ -82,6 +82,12 @@ try:
 except ImportError:
     TF_AVAILABLE = False
 
+try:
+    import traci
+    TRACI_AVAILABLE = True
+except ImportError:
+    TRACI_AVAILABLE = False
+
 # Cardinal directions the model knows about
 _DIRECTIONS = ["N", "S", "E", "W"]
 
@@ -181,13 +187,14 @@ def _lane_to_direction(lane_id: str) -> Optional[str]:
 def _int_to_bits(action_int: int, n_bits: int = 8) -> List[int]:
     """
     Convert integer 0..255 to a list of n_bits bits, MSB first.
+    Mirrors the teacher's trad_action(): bits[0] = most significant bit.
     Example: _int_to_bits(6, 8) -> [0, 0, 0, 0, 0, 1, 1, 0]
     """
     bits = []
     for _ in range(n_bits):
         bits.append(action_int % 2)
         action_int //= 2
-    return list(reversed(bits))
+    return list(reversed(bits))  # MSB-first, matching trad_action()
 
 
 class IntersectionAgent:
@@ -265,12 +272,26 @@ class IntersectionAgent:
                 continue   # outgoing or unrecognised -> skip
             action[lane_id] = direction_bits[direction]
 
-        # Deadlock guard: all-zero -> override to all-go
+        # Deadlock guard: all-zero -> release only the longest-waiting leader
+        # (liberating everyone at once risks collisions; FCFS is safer)
         if action and all(v == 0 for v in action.values()):
-            print("[DEADLOCK] We put all values to 1!")
-
-            for lane_id in action:
-                action[lane_id] = 1
+            print("[DEADLOCK GUARD] All lanes stopped — releasing longest-waiting leader.")
+            best_lane = None
+            best_wait = -1.0
+            for lid in action:
+                vid = leaders.get(lid)
+                if vid is None:
+                    continue
+                try:
+                    wait = traci.vehicle.getAccumulatedWaitingTime(vid)
+                except Exception:
+                    wait = 0.0
+                if wait > best_wait:
+                    best_wait = wait
+                    best_lane = lid
+            if best_lane is None:
+                best_lane = next(iter(action))  # fallback: first lane
+            action[best_lane] = 1
 
         return action
 
@@ -282,8 +303,8 @@ class IntersectionAgent:
         """Run CNN forward pass, return greedy action integer 0-255."""
         if image.dtype != np.uint8:
             image = image.astype(np.uint8)
-        state_tensor     = tf.convert_to_tensor(image, dtype=tf.float32)
-        state_tensor     = tf.expand_dims(state_tensor, 0)
+        state_tensor = tf.convert_to_tensor(image, dtype=tf.float32) / 255.0  # normalise [0, 1]
+        state_tensor = tf.expand_dims(state_tensor, 0)
         action_probs = self.model(state_tensor, training=False)
         return int(tf.argmax(action_probs[0]).numpy())
 
