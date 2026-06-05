@@ -68,6 +68,7 @@ import sys
 import subprocess
 import time
 from typing import Any, Dict, List, Optional, Tuple
+from .reward import RewardCalculator
 
 # Cleaning import in cas of not installed SUMO
 try:
@@ -178,6 +179,7 @@ class SumoEnvironment:
         self._dest_colors           = dest_colors
         self._intersection_outgoing = intersection_outgoing
         self._bbox                  = bbox
+        self.reward_calculator        = RewardCalculator()  # default config, can be customised later
 
 
         # Resolve SUMO binary
@@ -362,8 +364,7 @@ class SumoEnvironment:
  
         # 3. Reward: vehicles that completed their route this step 
         # Must be read AFTER simulationStep() so the counter is updated.
-        reward = float(traci.simulation.getArrivedNumber())
-        print(f"[Reward] step={self._current_step} | arrived={reward:.0f}")
+        reward = self.reward_calculator.compute()
  
         # 4. Build observation 
         obs  = self._build_observation()
