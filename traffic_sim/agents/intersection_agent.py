@@ -303,7 +303,7 @@ class IntersectionAgent:
         """Run CNN forward pass, return greedy action integer 0-255."""
         if image.dtype != np.uint8:
             image = image.astype(np.uint8)
-        state_tensor = tf.convert_to_tensor(image, dtype=tf.float32) / 255.0  # normalise [0, 1]
+        state_tensor = tf.convert_to_tensor(image, dtype=tf.float32) 
         state_tensor = tf.expand_dims(state_tensor, 0)
         action_probs = self.model(state_tensor, training=False)
         return int(tf.argmax(action_probs[0]).numpy())
