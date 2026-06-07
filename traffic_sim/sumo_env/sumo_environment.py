@@ -2,65 +2,53 @@
 """
 SumoEnvironment
 
-    The central class of the simulation package.  It wraps the SUMO/TraCI interface and exposes the control loop defined in the project specification:
+    The central class of the simulation package.  It wraps the SUMO/TraCI
+    interface and exposes the control loop defined in the project specification:
 
     env = SumoEnvironment(...)
     env.start()
-    obs = env.reset() -> ndarray (n, n, 3)
+    obs = env.reset()
     while not done:
-        obs, info = env.step(action, simulation_time)
+        obs, reward, done, info = env.step(action)
     env.close()
 
-TraCI (Traffic Control Interface) :
+--------------------------------------------------------------------------
+HOW step() WORKS  (single-step, compatible with multi-intersection)
+--------------------------------------------------------------------------
+  Each call to step():
+    1. Retrieve current leaders (single query, reused everywhere).
+    2. Set speed mode 55 for newly loaded vehicles (disables junction ROW
+       so the AI agent has full control over who crosses).
+    3. Stop all non-leader vehicles on incoming edges (follower control).
+    4. Apply go/stop to leaders via traci.vehicle.setStop().
+    5. Advance the simulation by ONE step (traci.simulationStep()).
+    6. Return (observation, reward, done, info).
 
-TraCI is SUMO's Python API.  It lets an external process (our Python code) connect to a running SUMO instance over a socket and query / control the
-simulation at every time step.
-
-Key TraCI concepts used here:
-  - traci.start()       => launch SUMO and open the connection
-  - traci.simulationStep() => advance simulation by one step
-  - traci.close()       => shut down the connection
-  - traci.vehicle.*     => vehicle state and control commands
-  - traci.edge.*        => edge-level statistics
+  The AgentCallManager in main.py decides whether to re-call the agent
+  or replay the previous action.  This avoids the "stuttering" problem
+  of multi-step step() in multi-intersection networks, where waiting
+  for leaders to cross at one intersection blocks decisions at others.
 
 --------------------------------------------------------------------------
-WHAT CHANGED vs. the original version
+Follower control  (matching the teacher's set_loaded_vehicle)
 --------------------------------------------------------------------------
-1. ``step()`` now returns the standard RL 4-tuple:
-       (observation, reward, done, info)
- 
-2. ``reset()`` now returns an ``observation`` dict.
- 
-3. New sub-component: ``ObservationBuilder`` (observation.py)
-   builds the (nxnx3) RGB image every step.
- 
-4. Reward = traci.simulation.getArrivedNumber()  - exactly the teacher's
-   reference.  One positive integer per vehicle that completed its route
-   this step.  No configuration needed.
- 
-5. Action format  {lane_id: 0 | 1}
-       1 -> leader of that lane is allowed to go  (speed = -1, SUMO default)
-       0 -> leader of that lane is stopped        (speed = 0)
-   The legacy ActionHandler formats (speed dict, list of action dicts) are
-   also still accepted for non-RL usage.
- 
-6. The ``observation`` dict returned every step contains:
-       "image"   -> ndarray (n, n, 3) uint8 - sent to the agent
-       "state"   -> dict               - raw TraCI snapshot (for debugging)
-       "leaders" -> dict               - {lane_id: vehicle_id | None}
- 
---------------------------------------------------------------------------
-Extending the action space
---------------------------------------------------------------------------
-Currently: discrete  {lane_id: 0 | 1}
-Later continuous:    {lane_id: float}  (target speed in m/s)
- 
-The dispatch logic is in ``_apply_action()``.  To add continuous actions:
-    1. Check ``isinstance(v, float) and v > 1`` in ``_apply_action()``.
-    2. Call ``self.action_handler._apply_speed(vehicle_id, v)``.
-No other method needs to change.
---------------------------------------------------------------------------
+  Non-leader vehicles are stopped 10 m before the end of their edge
+  using traci.vehicle.setStop().  This prevents followers from pushing
+  into the intersection uncontrolled.
 
+--------------------------------------------------------------------------
+Leader actions  (matching the teacher's set_leaders_actions2)
+--------------------------------------------------------------------------
+  action=0 -> traci.vehicle.setStop(vid, edge, pos)    = stop before junction
+  action=1 -> traci.vehicle.setStop(vid, edge, pos, duration=0) = release
+              traci.vehicle.setSpeed(vid, -1)           = return to SUMO
+
+--------------------------------------------------------------------------
+Speed mode  (matching the teacher's set_speed_mode)
+--------------------------------------------------------------------------
+  Mode 55 = binary 110111 = disable right-of-way check at junctions
+  (bit 3).  Applied to all newly loaded vehicles each step so the AI
+  agent controls who crosses, not SUMO's default priority rules.
 """
 
 import os
@@ -68,16 +56,14 @@ import sys
 import subprocess
 import time
 from typing import Any, Dict, List, Optional, Tuple
-from .reward import RewardCalculator
 
-# Cleaning import in cas of not installed SUMO
+# Safe import of traci
 try:
     import traci
     import traci.constants as tc
     TRACI_AVAILABLE = True
 except ImportError:
     TRACI_AVAILABLE = False
-    # Define a stub so the rest of the module can be imported without SUMO
     class _TraciStub:
         def __getattr__(self, name):
             raise EnvironmentError(
@@ -93,19 +79,19 @@ from .actions import ActionHandler
 from .statistics import StatisticsCollector
 from .observation import ObservationBuilder
 
+# Speed mode: 55 = binary 110111 = disable junction right-of-way (bit 3)
+_SPEED_MODE_AI_CONTROL = 55
+
 
 class SumoEnvironment:
     """
     Main interface to the SUMO simulation.
 
     Lifecycle
-        1. start()  =>> one-time setup: validates files, configures SUMO command.
-        2. reset()  =>> (re)launches SUMO, connects TraCI, returns first state.
-        3. step()   =>> applies an action, advances simulation, returns new state.
-        4. close()  =>> terminates the SUMO process and disconnects TraCI.
-
-    The environment can be reset() multiple times without calling start()
-    again (useful for running multiple episodes in a training loop).
+        1. start()  => validates files, configures SUMO command.
+        2. reset()  => (re)launches SUMO, connects TraCI, returns first obs.
+        3. step()   => applies action, advances 1 step, returns new obs.
+        4. close()  => terminates SUMO and disconnects TraCI.
 
     Parameters
     ----------
@@ -118,26 +104,21 @@ class SumoEnvironment:
     step_length : float
         Duration of each simulation step in seconds.
     max_steps : int
-        Maximum steps per episode before ``done=True``.
+        Maximum simulation time in seconds before done=True.
     sumo_home : str | None
         SUMO installation directory.  Falls back to $SUMO_HOME.
     port : int
-        TraCI connection port.  Change when running parallel instances.
+        TraCI connection port.
     seed : int
         Random seed for reproducible vehicle insertion.
-
-    -- Observation parameters ----------------------------------------
     image_size : int
-        Side length in pixels of the RGB image sent to the agent.
-        Default 50  -> shape (50, 50, 3).
+        Side length in pixels of the RGB observation image.
     dest_colors : dict | None
-        {edge_id: (R, G, B)} colour table for the image.
-        Pass this to match your own network's exit edge names.
+        {edge_id: (R, G, B)} colour table for the observation image.
     intersection_outgoing : set | None
-        Edge IDs outgoing from the main intersection (drawn white).
+        Edge IDs drawn white in the observation image.
     bbox : tuple | None
         World-space bounding box: ((xmin, ymin), (xmax, ymax)).
-
     """
 
     def __init__(
@@ -154,7 +135,6 @@ class SumoEnvironment:
         dest_colors:            Optional[Dict]  = None,
         intersection_outgoing:  Optional[set]   = None,
         bbox:                   Optional[Any]   = None,
-
     ):
         if not os.path.isfile(net_file):
             raise FileNotFoundError(
@@ -179,16 +159,12 @@ class SumoEnvironment:
         self._dest_colors           = dest_colors
         self._intersection_outgoing = intersection_outgoing
         self._bbox                  = bbox
-        self.reward_calculator        = RewardCalculator()  # default config, can be customised later
-
 
         # Resolve SUMO binary
         sumo_home = sumo_home or os.environ.get("SUMO_HOME", "")
         if sumo_home:
             bin_name   = "sumo-gui" if use_gui else "sumo"
             self._sumo_bin = os.path.join(sumo_home, "bin", bin_name)
-
-            # Also add SUMO tools to sys.path so traci can be imported
             tools_dir = os.path.join(sumo_home, "tools")
             if tools_dir not in sys.path:
                 sys.path.insert(0, tools_dir)
@@ -201,12 +177,11 @@ class SumoEnvironment:
         self._sumo_process: Optional[subprocess.Popen] = None
 
         # Sub-components (initialised after TraCI connects in reset())
-        self.state_extractor:     Optional[StateExtractor]     = None
-        self.action_handler:      Optional[ActionHandler]       = None
-        self.statistics_collector: Optional[StatisticsCollector] = None
-        self.observation_builder:  Optional[ObservationBuilder]  = None
+        self.state_extractor:      Optional[StateExtractor]      = None
+        self.action_handler:       Optional[ActionHandler]        = None
+        self.statistics_collector: Optional[StatisticsCollector]  = None
+        self.observation_builder:  Optional[ObservationBuilder]   = None
 
-        # Flag: start() has been called
         self._started = False
 
         print(
@@ -217,73 +192,59 @@ class SumoEnvironment:
             f"  step_length: {self.step_length}s\n"
             f"  max_steps  : {self.max_steps}\n"
             f"  port       : {self.port}\n"
-            f"  image_size  : {self._image_size}px\n"
+            f"  image_size : {self._image_size}px\n"
         )
+
+    # ================================================================== #
+    #  Lifecycle methods                                                   #
+    # ================================================================== #
 
     def start(self) -> None:
         """
         Validate the environment and prepare the SUMO command.
-
-        This method does NOT launch SUMO yet -> that happens in reset().
-        Call start() once before the first reset().
-
-        Raises:
-            EnvironmentError
-                If the SUMO binary cannot be found.
+        Does NOT launch SUMO — that happens in reset().
         """
         if not TRACI_AVAILABLE:
             raise EnvironmentError(
                 "TraCI is not available.  Make sure SUMO is installed and "
                 "$SUMO_HOME/tools is in your PYTHONPATH."
             )
-
-        # Check the SUMO binary exists
         if not self._sumo_bin_exists():
             raise EnvironmentError(
                 f"SUMO binary not found: '{self._sumo_bin}'\n"
                 "Set the SUMO_HOME environment variable or add the SUMO "
                 "bin/ directory to your system PATH."
             )
-
         self._started = True
         print("[SumoEnvironment] start() complete -> ready to reset().")
-
 
     def reset(self) -> Dict[str, Any]:
         """
         Launch (or relaunch) SUMO, connect via TraCI, and return the
-        initial state observation.
+        initial observation.
 
-        Returns :
-            observation : dict
-                "image"   -> ndarray (n, n, 3) uint8  -> fed directly to the agent
-                "state"   -> dict                      -> full raw TraCI snapshot
-                "leaders" -> dict {lane_id: vid|None}  -> current lane leaders
-
-        Raises :
-            RuntimeError
-                If start() has not been called first.
+        Returns
+        -------
+        observation : dict
+            "image"   -> ndarray (n, n, 3) uint8
+            "state"   -> dict
+            "leaders" -> dict {lane_id: vid|None}
         """
         if not self._started:
-            raise RuntimeError(
-                "Call start() before reset()."
-            )
+            raise RuntimeError("Call start() before reset().")
 
-        # If a simulation is already running, close it cleanly
         if self._simulation_running:
             self._close_traci()
 
-        # Build the SUMO command (writes .sumocfg first for realistic junction behaviour)
         cfg_path = self._write_sumocfg()
         sumo_cmd = self._build_sumo_command(cfg_path)
         print(f"[SumoEnvironment] Launching SUMO: {' '.join(sumo_cmd)}")
 
-        # Start SUMO and connect TraCI
         traci.start(sumo_cmd, port=self.port)
         self._simulation_running = True
         self._current_step = 0
 
-        # Initialise sub-components now that TraCI is connected
+        # Initialise sub-components
         self.state_extractor      = StateExtractor()
         self.action_handler       = ActionHandler(step_length=self.step_length)
         self.statistics_collector = StatisticsCollector()
@@ -293,168 +254,140 @@ class SumoEnvironment:
             bbox                  = self._bbox,
         )
 
-        # TODO See if we return the state as before like below or only the image
-
-        # Return first observation
-        # initial_state = self.create_state()
-
-         
         obs = self._build_observation()
         print(
             f"[SumoEnvironment] reset() complete -> "
             f"image shape {obs['image'].shape}, "
             f"{len(obs['leaders'])} lanes tracked."
         )
-
-        print("[SumoEnvironment] reset() complete => simulation started.")
-        
-        #return initial_state
         return obs
 
+    # ================================================================== #
+    #  step()  — SINGLE-STEP, multi-intersection friendly                  #
+    # ================================================================== #
 
     def step(
         self,
         action: Any = None,
-        simulation_time: Optional[float] = None,
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    ) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
         """
-        Apply an action, advance the simulation by one step.
- 
+        Apply an action, advance the simulation by ONE step, and return
+        the new observation.
+
+        Single-step design rationale
+        ----------------------------
+        In multi-intersection networks, a multi-step step() that blocks
+        until leaders cross causes "stuttering": intersection A waits for
+        its leader to cross while intersection B urgently needs a new
+        decision.  Single-step avoids this; the AgentCallManager in
+        main.py handles re-triggering only when meaningful changes occur.
+
+        The critical fixes from the teacher's code are applied WITHIN
+        each single step:
+          - Follower control  (non-leaders stopped before intersection)
+          - setStop / release (leaders controlled via setStop, not setSpeed)
+          - Speed mode 55     (disable SUMO junction right-of-way)
+
         Parameters
         ----------
         action : dict | None
-            Discrete binary dict  {lane_id: 0 | 1}
-                1 -> let the leader of this lane go  (speed restored to -1)
-                0 -> stop the leader of this lane    (speed = 0)
- 
-            Pass ``None`` for no external control (SUMO runs freely).
-            Legacy ActionHandler formats (speed dict, list of action dicts)
-            are also accepted.
- 
+            {lane_id: 0 | 1}  where 1=go, 0=stop.
+            Pass None for free-running SUMO (no external control).
+
         Returns
         -------
         observation : dict
-            "image"   -> ndarray (n, n, 3) uint8
-            "state"   -> dict  (raw TraCI snapshot)
-            "leaders" -> dict  {lane_id: vehicle_id | None}
- 
-        reward : float
-            Number of vehicles that completed their route this step.
-            (Exactly ``traci.simulation.getArrivedNumber()``, the teacher's
-            reference reward.)
- 
-        done : bool
-            True when the episode should end.
- 
-        info : dict
-            "step"            -> current step index
-            "simulation_time" -> SUMO clock in seconds
-            "done"            -> same as the done return value
-            "stats"           -> snapshot from statistics()
+        reward      : float   (vehicles that arrived this step)
+        done        : bool
+        info        : dict
         """
         self._check_running()
- 
-        # 1. Apply action 
-        if action is not None:
-            self._apply_action(action)
- 
-        # 2. Advance simulation 
+
+        # ---- 1. Set speed mode for newly loaded vehicles ----
+        self._set_speed_modes_loaded()
+
+        # ---- 2. Apply action ----
+        incoming_leaders = None
+
+        if action is not None and isinstance(action, dict) and self._looks_binary(action):
+            # Get current leaders (single query, reused by stop + action)
+            all_leaders      = self.state_extractor.get_leaders()
+            incoming_leaders = self._filter_incoming_leaders(all_leaders)
+
+            # Stop all non-leader vehicles on incoming edges
+            self._stop_non_leaders(incoming_leaders)
+
+            # Apply go/stop to leaders via setStop
+            self._apply_binary_action(action, incoming_leaders)
+
+        elif action is not None:
+            # Legacy path: speed dict or list of action dicts
+            self.action_handler.set_action(action)
+
+        # ---- 3. Advance simulation by ONE step ----
         traci.simulationStep()
         self._current_step += 1
- 
-        # 3. Reward: vehicles that completed their route this step 
-        # Must be read AFTER simulationStep() so the counter is updated.
-        reward = self.reward_calculator.compute()
- 
-        # 4. Build observation 
+
+        # Set speed mode for vehicles that just loaded during this step
+        self._set_speed_modes_loaded()
+
+        # Stop vehicles that just departed and are not leaders
+        if incoming_leaders is not None:
+            self._stop_departed_non_leaders(incoming_leaders)
+
+        # ---- 4. Reward: vehicles that completed their route ----
+        reward = float(traci.simulation.getArrivedNumber())
+
+        # ---- 5. Build observation ----
         obs  = self._build_observation()
         done = self._is_done()
- 
-        # 5. Collect statistics 
+
+        # ---- 6. Collect statistics ----
         stats = self.statistics_collector.statistics()
- 
+
         info = {
             "step":            self._current_step,
             "simulation_time": traci.simulation.getTime(),
             "done":            done,
             "stats":           stats,
         }
- 
+
         if done:
             print(
                 f"[SumoEnvironment] Episode finished at step "
                 f"{self._current_step} (t={info['simulation_time']:.1f}s)."
             )
- 
+
         return obs, reward, done, info
 
-
     def close(self) -> None:
-        """
-        Cleanly close the TraCI connection and terminate SUMO.
-        Call this when you are completely done with the environment.
-        """
+        """Cleanly close the TraCI connection and terminate SUMO."""
         if self._simulation_running:
             self._close_traci()
         print("[SumoEnvironment] Environment closed.")
 
-    #  ---- Spec functions: state, statistics, leaders ----
+    # ================================================================== #
+    #  Spec functions: state, statistics, leaders                          #
+    # ================================================================== #
 
     def create_state(self) -> Dict[str, Any]:
-        """
-        Retrieve the current environment state.
-
-        Returns a dictionary with:
-          - vehicle_ids      => list of all vehicles currently in the network
-          - vehicle_speeds   => {vehicle_id: speed_m_s}
-          - vehicle_positions=> {vehicle_id: (x, y)}
-          - vehicle_edges    => {vehicle_id: edge_id}
-          - edge_occupancies => {edge_id: occupancy_%}
-          - edge_speeds      => {edge_id: mean_speed_m_s}
-          - waiting_times    => {vehicle_id: accumulated_waiting_time_s}
-          - simulation_time  => current simulation clock (s)
-          - leaders          => output of get_leaders()
-        """
+        """Retrieve the current environment state."""
         self._check_running()
         return self.state_extractor.create_state()
 
     def statistics(self) -> Dict[str, Any]:
-        """
-        Collect simulation-wide statistics.
-
-        Returns :
-            dict with keys:
-                - mean_speed        => average speed of all vehicles (m/s)
-                - mean_waiting_time => average waiting time per vehicle (s)
-                - throughput        => vehicles that have completed their trip
-                - total_vehicles    => vehicles currently in network
-                - mean_travel_time  => average travel time of completed trips (s)
-                - step             => current step number
-                - simulation_time   => current simulation clock (s)
-                - congestion_index  => mean occupancy across all edges (%)
-                - peak_congestion  => max occupancy across all edges (%)
-                - total_collisions  => total number of collisions (if enabled in SUMO)
-        """
+        """Collect simulation-wide statistics."""
         self._check_running()
         return self.statistics_collector.statistics()
 
     def get_leaders(self) -> Dict[str, Optional[str]]:
-        """
-        Retrieve the leader vehicle for each lane on each edge.
-
-        A "leader" vehicle is the frontmost vehicle on a given lane =>
-        the one that determines the speed of vehicles behind it.
-
-        Returns :
-  
-            dict : {lane_id: vehicle_id | None}
-                Maps each lane to its current leader, or None if the lane
-                is empty.
-        """
+        """Retrieve the leader vehicle for each lane."""
         self._check_running()
         return self.state_extractor.get_leaders()
 
-    # ---- Context manager support  (with SumoEnvironment(...) as env:) ----
+    # ================================================================== #
+    #  Context manager support                                             #
+    # ================================================================== #
 
     def __enter__(self):
         self.start()
@@ -462,41 +395,242 @@ class SumoEnvironment:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
-        return False   # do not suppress exceptions
+        return False
 
-
-    # ---- Properties ----
+    # ================================================================== #
+    #  Properties                                                          #
+    # ================================================================== #
 
     @property
     def current_step(self) -> int:
-        """Number of simulation steps taken since last reset."""
         return self._current_step
 
     @property
     def simulation_time(self) -> float:
-        """Current simulation clock in seconds (0.0 if not running)."""
         if self._simulation_running:
             return traci.simulation.getTime()
         return 0.0
 
     @property
     def is_running(self) -> bool:
-        """True if SUMO is currently connected and running."""
         return self._simulation_running
 
-    # ---- Internal Helpers ----
+    # ================================================================== #
+    #  Binary action helpers                                               #
+    # ================================================================== #
+
+    def _safe_set_stop(self, vid: str, road_id: str, stop_pos: float) -> bool:
+        """
+        Set a stop for *vid* at *stop_pos* on *road_id*, but ONLY if:
+          1. The vehicle hasn't already passed that position.
+          2. The vehicle doesn't already have a stop queued on this edge.
+
+        Without these checks, SUMO prints
+            "stop for vehicle X on lane Y is not downstream the current route"
+        to stderr even though the Python TraCIException is caught.
+
+        Returns True if the stop was successfully set.
+        """
+        try:
+            # Guard 1: vehicle already past the stop position?
+            current_pos = traci.vehicle.getLanePosition(vid)
+            if current_pos >= stop_pos:
+                return False
+
+            # Guard 2: vehicle already has a stop on this edge?
+            for stop in traci.vehicle.getNextStops(vid):
+                # stop is a tuple: (lane, endPos, stoppingPlaceID, flags, duration, until)
+                # lane format: "edge_id_laneIndex"  -> check if it starts with road_id
+                if stop[0].startswith(road_id):
+                    return False
+
+            traci.vehicle.setStop(vid, road_id, stop_pos)
+            return True
+
+        except traci.TraCIException:
+            return False
+
+    def _apply_binary_action(
+        self,
+        action: Dict[str, int],
+        leaders: Dict[str, Optional[str]],
+    ) -> None:
+        """
+        Apply a discrete {lane_id: 0|1} action to leader vehicles.
+
+        Uses traci.vehicle.setStop() to match the teacher's reference:
+          - action=0 -> queue a stop 10 m before edge end
+          - action=1 -> release any existing stop, return to SUMO control
+
+        Parameters
+        ----------
+        action  : {lane_id: 0|1}
+        leaders : {lane_id: vehicle_id|None}  (pre-queried, NOT re-fetched)
+        """
+        for lane_id, go in action.items():
+            vehicle_id = leaders.get(lane_id)
+            if vehicle_id is None:
+                continue
+
+            try:
+                road_id = traci.vehicle.getRoadID(vehicle_id)
+                if road_id.startswith(":"):
+                    continue
+
+                lane   = traci.vehicle.getLaneID(vehicle_id)
+                length = traci.lane.getLength(lane)
+                stop_pos = max(1.0, length - 10.0)
+
+                if go == 1:
+                    # Release: remove existing stop, hand back to SUMO
+                    traci.vehicle.setColor(vehicle_id, (0, 255, 0))
+                    if traci.vehicle.getNextStops(vehicle_id):
+                        traci.vehicle.setStop(
+                            vehicle_id, road_id, stop_pos, duration=0
+                        )
+                    traci.vehicle.setSpeed(vehicle_id, -1)
+                else:
+                    # Stop before intersection
+                    traci.vehicle.setColor(vehicle_id, (255, 0, 0))
+                    self._safe_set_stop(vehicle_id, road_id, stop_pos)
+
+            except traci.TraCIException:
+                pass
+
+    def _stop_non_leaders(
+        self,
+        incoming_leaders: Dict[str, Optional[str]],
+    ) -> None:
+        """
+        Stop ALL active non-leader vehicles on incoming edges.
+
+        Called once per step before actions are applied.  Non-leaders are
+        stopped 10 m before the edge end via setStop().  Vehicles on
+        internal edges (inside junction) or outgoing edges (past the
+        intersection) are left alone.
+
+        Matches the teacher's set_loaded_vehicle().
+        """
+        leader_vids = {vid for vid in incoming_leaders.values()
+                       if vid is not None}
+
+        for vid in traci.vehicle.getIDList():
+            if vid in leader_vids:
+                continue
+            try:
+                road_id = traci.vehicle.getRoadID(vid)
+                if road_id.startswith(":"):
+                    continue
+                if self._is_outgoing_edge(road_id):
+                    continue
+
+                lane   = traci.vehicle.getLaneID(vid)
+                length = traci.lane.getLength(lane)
+                stop_pos = max(1.0, length - 10.0)
+                if self._safe_set_stop(vid, road_id, stop_pos):
+                    traci.vehicle.setColor(vid, (255, 200, 0))
+            except traci.TraCIException:
+                pass
+
+    def _stop_departed_non_leaders(
+        self,
+        incoming_leaders: Dict[str, Optional[str]],
+    ) -> None:
+        """
+        Stop vehicles that just departed this step and are not leaders.
+
+        Called AFTER simulationStep() to catch new arrivals that entered
+        the network during this step.
+        """
+        leader_vids = {vid for vid in incoming_leaders.values()
+                       if vid is not None}
+
+        for vid in traci.simulation.getDepartedIDList():
+            if vid in leader_vids:
+                continue
+            try:
+                road_id = traci.vehicle.getRoadID(vid)
+                if road_id.startswith(":"):
+                    continue
+                lane   = traci.vehicle.getLaneID(vid)
+                length = traci.lane.getLength(lane)
+                stop_pos = max(1.0, length - 10.0)
+                if self._safe_set_stop(vid, road_id, stop_pos):
+                    traci.vehicle.setColor(vid, (255, 200, 0))
+            except traci.TraCIException:
+                pass
+
+    def _set_speed_modes_loaded(self) -> None:
+        """
+        Set speed mode to 55 for all newly loaded vehicles.
+
+        Mode 55 = binary 110111 = disable junction right-of-way (bit 3).
+        This gives the AI agent full control over who crosses.
+        Matches the teacher's set_speed_mode().
+        """
+        for vid in traci.simulation.getLoadedIDList():
+            try:
+                traci.vehicle.setSpeedMode(vid, _SPEED_MODE_AI_CONTROL)
+            except traci.TraCIException:
+                pass
+
+    # ================================================================== #
+    #  Leader / edge helpers                                               #
+    # ================================================================== #
+
+    def _filter_incoming_leaders(
+        self,
+        all_leaders: Dict[str, Optional[str]],
+    ) -> Dict[str, Optional[str]]:
+        """
+        Keep only lanes that are INCOMING to an intersection.
+
+        Filters out:
+          - Internal SUMO lanes (id starts with ':')
+          - Outgoing lanes (destination is a border node N/S/E/W)
+        """
+        incoming: Dict[str, Optional[str]] = {}
+        for lane_id, vid in all_leaders.items():
+            if lane_id.startswith(":"):
+                continue
+            edge_id = self._lane_to_edge(lane_id)
+            if self._is_outgoing_edge(edge_id):
+                continue
+            incoming[lane_id] = vid
+        return incoming
+
+    @staticmethod
+    def _lane_to_edge(lane_id: str) -> str:
+        """Strip the trailing '_<digit>' lane index from a lane ID."""
+        if "_" in lane_id:
+            parts = lane_id.rsplit("_", 1)
+            if parts[1].isdigit():
+                return parts[0]
+        return lane_id
+
+    @staticmethod
+    def _is_outgoing_edge(edge_id: str) -> bool:
+        """
+        Return True if edge_id goes toward a border node.
+
+        Border nodes start with N/S/E/W.  Outgoing edges have one of
+        these as their destination:
+            "C_to_N"          -> dest "N"       -> outgoing
+            "J0_to_N0"        -> dest "N0"      -> outgoing
+            "J_0_0_to_S_0_0"  -> dest "S_0_0"   -> outgoing
+            "J0_to_J1"        -> dest "J1"      -> NOT outgoing
+        """
+        if "_to_" not in edge_id:
+            return False
+        dest = edge_id.split("_to_")[-1]
+        return bool(dest) and dest[0] in ("N", "S", "E", "W")
+
+    # ================================================================== #
+    #  Observation builder                                                 #
+    # ================================================================== #
 
     def _build_observation(self) -> Dict[str, Any]:
-        """
-        Build the observation dict returned by reset() and step().
- 
-        Returns
-        -------
-        dict:
-            "image"   -> ndarray (n, n, 3)  - the pixel map fed to the agent
-            "state"   -> dict               - full raw TraCI snapshot
-            "leaders" -> dict               - {lane_id: vehicle_id | None}
-        """
+        """Build the observation dict returned by reset() and step()."""
         raw_state = self.state_extractor.create_state()
         image     = self.observation_builder.build_image(n=self._image_size)
         return {
@@ -504,107 +638,64 @@ class SumoEnvironment:
             "state":   raw_state,
             "leaders": raw_state["leaders"],
         }
- 
-    def _apply_action(self, action: Any) -> None:
-        """
-        Dispatch the action to the correct handler.
- 
-        Discrete binary  {lane_id: 0|1}   -> _apply_binary_action()
-        Legacy speed     {vid: float}      -> ActionHandler.set_action()
-        Legacy list      [{"vehicle_id":…} -> ActionHandler.set_action()
- 
-        Extending to continuous actions
-        --------------------------------
-        Add an ``elif`` here that checks for float values > 1 and calls
-        ``self.action_handler._apply_speed(vehicle_id, v)`` directly.
-        """
-        if isinstance(action, dict) and self._looks_binary(action):
-            self._apply_binary_action(action)
-        else:
-            # Legacy path: speed dict or list of action dicts
-            self.action_handler.set_action(action)
- 
-    def _looks_binary(self, action: dict) -> bool:
+
+    # ================================================================== #
+    #  Action format detection                                             #
+    # ================================================================== #
+
+    @staticmethod
+    def _looks_binary(action: dict) -> bool:
         """Return True if every value in the action dict is 0 or 1."""
         return all(v in (0, 1, 0.0, 1.0) for v in action.values())
- 
-    def _apply_binary_action(self, action: Dict[str, int]) -> None:
-        """
-        Apply a discrete {lane_id: 0|1} action to leader vehicles.
- 
-        Called every step before ``traci.simulationStep()``.
- 
-        For each lane present in the action dict:
-            1 -> restore SUMO's car-following model  (speed = -1)
-            0 -> force the vehicle to stop           (speed = 0)
- 
 
-        Lanes absent from the action dict are left unchanged.
-        """
-        leaders = self.state_extractor.get_leaders()
-
-        for lane_id, go in action.items():
-            vehicle_id = leaders.get(lane_id)
-            if vehicle_id is None:
-                continue   # lane is empty - nothing to do
- 
-            if go:
-                self.action_handler._reset_vehicle(vehicle_id)
-            else:
-                self.action_handler._apply_speed(vehicle_id, 0.0)
-
+    # ================================================================== #
+    #  Episode termination                                                 #
+    # ================================================================== #
 
     def _is_done(self) -> bool:
         """
         Return True when the episode should end.
-        Conditions:
-          - max_steps reached
-          - no more vehicles in the network AND simulation time > 60s
-            (allow some warm-up time before declaring done)
+          - simulation time >= max_steps
+          - no more vehicles expected AND simulation time > 60s
         """
-        if self._current_step >= self.max_steps:
-            return True
         sim_time = traci.simulation.getTime()
+        if sim_time >= self.max_steps:
+            return True
         if sim_time > 60 and traci.simulation.getMinExpectedNumber() == 0:
             return True
         return False
 
+    # ================================================================== #
+    #  SUMO process management                                             #
+    # ================================================================== #
+
     def _close_traci(self) -> None:
-        """Disconnect TraCI and set the running flag to False."""
         try:
             traci.close()
         except Exception:
-            pass   # ignore errors during cleanup
+            pass
         self._simulation_running = False
         print("[SumoEnvironment] TraCI connection closed.")
 
     def _check_running(self) -> None:
-        """Raise RuntimeError if the simulation is not active."""
         if not self._simulation_running:
-            raise RuntimeError(
-                "No simulation running.  Call reset() first."
-            )
+            raise RuntimeError("No simulation running.  Call reset() first.")
 
     def _sumo_bin_exists(self) -> bool:
-        """Check whether the SUMO binary is reachable."""
-        # If it is an absolute path, check directly
         if os.path.isabs(self._sumo_bin):
             return os.path.isfile(self._sumo_bin)
-        # Otherwise, check if it is on the system PATH
         import shutil
         return shutil.which(self._sumo_bin) is not None
 
-
-
     def _write_sumocfg(self) -> str:
         """
-        Write a .sumocfg configuration file next to the net file and return
-        its path.  Using a .sumocfg is the standard SUMO workflow and allows
-        netconvert / SUMO to apply correct turn-movement rules at
-        unsignalized intersections (right-of-way type = "right_before_left"
-        by default, which is the most realistic setting for urban intersections).
-        The file is (re)written on every reset() so it always reflects the
-        current net_file / route_file paths.
+        Write a .sumocfg configuration file next to the net file.
+
+        Key settings:
+          - time-to-teleport = 300 (removes stuck vehicles after 5 min;
+            prevents permanent deadlocks)
+          - collision.action = warn
+          - collision.check-junctions = true
         """
         import xml.etree.ElementTree as ET
         from xml.dom import minidom
@@ -616,30 +707,35 @@ class SumoEnvironment:
             "http://sumo.dlr.de/xsd/sumoConfiguration.xsd",
         )
 
-        # <input> block
         inp = ET.SubElement(config, "input")
-        ET.SubElement(inp, "net-file",    attrib={"value": os.path.basename(self.net_file)})
-        ET.SubElement(inp, "route-files", attrib={"value": os.path.basename(self.route_file)})
+        ET.SubElement(inp, "net-file",
+                      attrib={"value": os.path.basename(self.net_file)})
+        ET.SubElement(inp, "route-files",
+                      attrib={"value": os.path.basename(self.route_file)})
 
-        # <time> block
         tim = ET.SubElement(config, "time")
-        ET.SubElement(tim, "step-length", attrib={"value": str(self.step_length)})
+        ET.SubElement(tim, "step-length",
+                      attrib={"value": str(self.step_length)})
 
-        # <report> block - suppress noisy console output
         rep = ET.SubElement(config, "report")
         ET.SubElement(rep, "no-warnings",  attrib={"value": "true"})
         ET.SubElement(rep, "no-step-log",  attrib={"value": "true"})
 
-        # <processing> block - realistic unsignalized intersection behaviour
         proc = ET.SubElement(config, "processing")
-        ET.SubElement(proc, "time-to-teleport",      attrib={"value": "-1"})
-        ET.SubElement(proc, "waiting-time-memory",   attrib={"value": "10000"})
-        ET.SubElement(proc, "collision.action",      attrib={"value": "warn"})
+        ET.SubElement(proc, "time-to-teleport",
+                      attrib={"value": "300"})
+        ET.SubElement(proc, "waiting-time-memory",
+                      attrib={"value": "10000"})
+        ET.SubElement(proc, "collision.action",
+                      attrib={"value": "warn"})
+        ET.SubElement(proc, "collision.check-junctions",
+                      attrib={"value": "true"})
 
-        # Pretty-print and write
         raw      = ET.tostring(config, encoding="unicode")
         pretty   = minidom.parseString(raw).toprettyxml(indent="    ")
-        base = (self.net_file[:-len(".net.xml")] if self.net_file.endswith(".net.xml") else os.path.splitext(self.net_file)[0])
+        base = (self.net_file[:-len(".net.xml")]
+                if self.net_file.endswith(".net.xml")
+                else os.path.splitext(self.net_file)[0])
         cfg_path = base + ".sumocfg"
         with open(cfg_path, "w", encoding="utf-8") as fh:
             fh.write(pretty)
@@ -648,13 +744,11 @@ class SumoEnvironment:
         return cfg_path
 
     def _build_sumo_command(self, cfg_path: str) -> List[str]:
-        """Assemble the command line arguments for launching SUMO."""
         cmd = [
             self._sumo_bin,
-            "-c", cfg_path,           # use the generated .sumocfg
+            "-c", cfg_path,
             "--seed", str(self.seed),
         ]
-        # GUI-specific options
         if self.use_gui:
             cmd += ["--start", "--quit-on-end"]
         return cmd
