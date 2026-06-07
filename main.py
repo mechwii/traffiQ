@@ -16,33 +16,37 @@ Each agent wraps the teacher's pre-trained CNN (DQN) and receives:
 
 The agent returns  {lane_id: 0 | 1}  (1 = go, 0 = stop).
 
-Three problems solved vs the previous version
-----------------------------------------------
- 
-  FIX 1 : Smart agent call timing
-      The AI is no longer called on every simulation step.
-      Instead, the agent is called only when something meaningful changes
-      at its intersection: a new leader appears on a lane that was empty,
-      OR a previously allowed vehicle has cleared the intersection.
-      The current decision is held until that condition triggers again.
- 
-  FIX 2 : Variable action dict size (multi-lane)
-      With num_lanes=3, each direction produces 3 lanes:
-          E_to_C_0, E_to_C_1, E_to_C_2
-      The old code only output 4 bits, so some lanes were missing.
-      Now ALL lanes of the same direction share the same decision bit
-      (handled inside IntersectionAgent.act()).
- 
-  FIX 3 : Per-intersection cropped image
-      For multi-intersection networks, each agent now receives a 50x50
-      image cropped to ITS OWN intersection's bounding box instead of
-      the full network image.  Built by ObservationBuilder.build_image_for_intersection().
+Key design decisions
+--------------------
+
+  1. Smart agent call timing (AgentCallManager)
+      The AI is called only when something meaningful changes:
+      a new leader appears on a lane that was empty, OR a previously
+      allowed vehicle has cleared the intersection.  The current
+      decision is held until that condition triggers again.
+
+  2. Multi-step step()
+      env.step(action) advances the simulation MULTIPLE sub-steps
+      until the "go" leaders have crossed the intersection.  This
+      matches the teacher's reference and prevents stop/go oscillation.
+
+  3. Per-intersection cropped image
+      For multi-intersection networks, each agent receives a 50x50
+      image cropped to its own intersection's bounding box.
+
+  4. Shared model weights
+      All agents share a single Keras model instance loaded once from
+      disk.  This saves memory and load time.
+
+  5. Safety filter
+      The agent's _safety_filter() prevents conflicting perpendicular
+      "go" decisions (e.g. N and E simultaneously).  Only parallel
+      direction pairs (N+S or E+W) are allowed.
 
 Reward
 ------
-    +1 for every vehicle that completed its route this step.
-    (traci.simulation.getArrivedNumber() -> teacher's reference formula)
-
+    +1 for every vehicle that completed its route (summed across all
+    sub-steps within one agent step).
 
 Action order (per intersection, matching the teacher's training)
 ----------------------------------------------------------------
@@ -55,19 +59,6 @@ Supported scenarios
   num_intersections : 1 | 2 | 4 | 8
   num_lanes         : 1 | 2 | 3
 
-  Junction ID conventions (NetworkBuilder)
------------------------------------------
-  single intersection      : "C"
-  linear chain (count=2)   : "J0", "J1"
-  grid 2×2  (count=4)      : "J_0_0", "J_0_1", "J_1_0", "J_1_1"
-  grid 2×4  (count=8)      : "J_0_0" ... "J_1_3"
- 
-Lane naming conventions
------------------------
-  single:   "N_to_C_0", "E_to_C_1", ...
-  chain:    "N0_to_J0_0", "S1_to_J1_0", "W0_to_J0_0", ...
-  grid:     "N_0_0_to_J_0_0_0", "W_0_0_to_J_0_0_0", .
-
 Prerequisites
 -------------
   1. SUMO installed   https://sumo.dlr.de/docs/Downloads.php
@@ -75,51 +66,6 @@ Prerequisites
   3. Model saved at MODEL_PATH   (teacher's ./save_model directory)
   4. pip install numpy tensorflow keras
 """
-
-""" TODO 
-Re do the logic cause now we execute action each 5 seconds if it's okay
-We can also take leader when arriving in the intersection
-Also talk about deadlock
-
-# Crop the 50x50 image per intersection to make the multiagent works
-# Example of what the fix will look like later:
-    for i, agent in enumerate(agents):
-        
-        # You would need a function that cuts the giant image into a 50x50 piece
-        cropped_50x50_image = crop_image_for_intersection(obs["image"], intersection_index=i)
-        
-        local_obs = {
-            "image":   cropped_50x50_image,   # Now the agent ONLY sees its own intersection!
-            "leaders": local_leaders,
-        }
-        local_action = agent.act(local_obs)
-"""
-
-""" ---- DONE ---
-# TODO un agent par intersection donc envoie une intersection a un agent
-# et lui il va controler une intersection
-# L'agent respecte un ordre 
-#. West, Sud, Est, North 
-# Une intersection par agent 
-# Pas prendre en compte les Formes complex
-# prendre les couleurs généré par le prof 
-"""
-
-"""
-TODO also do the crop of different intersections cause now we are sending 1 big pic
-We have to send X intersections pics
-"""
-
-
-"""TODO fix deadlock issues
-Start redaction of the report, soutenance -> 16 june 
-
-Feu de signalisation modificaiton au niveau du fichier net, rajouter que 
-l'intersection est généré avec le temps de signalisation
-
-Ajouter le premier arrivé, premier servi (modificaiton de parameetre dans le net pour respecter ça )
-"""
-
 
 import os
 import sys
@@ -139,50 +85,41 @@ from traffic_sim.agents.agent_call_manager import AgentCallManager
 # ------------------------------------------------------------------------------
 
 SCENARIO = {
-    "intersection_type": "four_way", # "four_way" | "t_junction" | "complex"
-    "num_intersections": 1,  # 1 | 2 | 4 | 8
-    "num_lanes":         3, # 1 | 2 | 3 
+    "intersection_type": "four_way",  # "four_way" | "t_junction" | "complex"
+    "num_intersections": 1,           # 1 | 2 | 4 | 8
+    "num_lanes":         1,           # 1 | 2 | 3
 }
 
-DEMAND_LEVEL= "low"   # "low" | "moderate" | "high" | "congested"
-SIMULATION_DURATION = 300          # seconds
-USE_GUI     = True
-CONFIGS_DIR = "configs"
-PRINT_EVERY = 50
+DEMAND_LEVEL        = "congested"     # "low" | "moderate" | "high" | "congested"
+SIMULATION_DURATION = 300       # seconds
+USE_GUI             = True
+CONFIGS_DIR         = "configs"
+PRINT_EVERY         = 50
 
 # Path to the pre-trained SavedModel directory
 MODEL_PATH = os.path.join(".", "traffic_sim", "save_model")
 
-# Observation image size -> must match what the model was trained on
-IMAGE_SIZE = 50  # the agent receives a (50 × 50 × 3) uint8 RGB image
+# Observation image size — must match what the model was trained on
+IMAGE_SIZE = 50
 SHOW_CROPPED_IMAGE = True
 
 DEST_COLORS: Optional[Dict] = None
-# Example for the NetworkBuilder four_way_1int network:
-# DEST_COLORS = {
-#     "C_to_N": (1.0, 0.0, 0.0),   # red    -> north exit
-#     "C_to_S": (0.0, 1.0, 0.0),   # green  -> south exit
-#     "C_to_E": (0.0, 0.0, 1.0),   # blue   -> east  exit
-#     "C_to_W": (1.0, 1.0, 0.0),   # yellow -> west  exit
-# }
-
 INTERSECTION_OUTGOING: Optional[set] = None
-# Example:
-# INTERSECTION_OUTGOING = {"C_to_N", "C_to_S", "C_to_E", "C_to_W"}
+
 
 # ------------------------------------------------------------------------------
 #  Helper: Junction ID resolver
 # ------------------------------------------------------------------------------
+
 def get_junction_ids(num_intersections: int) -> List[str]:
     """
-    Return the ordered list of junction node IDs for a given intersection count.
- 
-    Matches the naming produced by NetworkBuilder exactly:
+    Return the ordered list of junction node IDs for a given count.
+
+    Matches NetworkBuilder naming exactly:
         1  -> ["C"]
         2  -> ["J0", "J1"]
         4  -> ["J_0_0", "J_0_1", "J_1_0", "J_1_1"]
-        8  -> ["J_0_0", "J_0_1", "J_0_2", "J_0_3",
-                "J_1_0", "J_1_1", "J_1_2", "J_1_3"]
+        8  -> ["J_0_0" ... "J_1_3"]
     """
     if num_intersections == 1:
         return ["C"]
@@ -199,64 +136,6 @@ def get_junction_ids(num_intersections: int) -> List[str]:
 #  Helper: assign lanes to intersections
 # ------------------------------------------------------------------------------
 
-"""
-def assign_lanes_to_intersections(
-    leaders: Dict[str, Any],
-    num_intersections: int,
-) -> List[Dict[str, Any]]:
-    
-    Split the global leaders dict into one sub-dict per intersection.
-
-    For a single-intersection network all lanes go to agent 0.
-    For multi-intersection networks, lanes are partitioned by the
-    intersection index encoded in the edge name:
-
-        "N_to_C0_0"  -> intersection 0
-        "W_to_C1_1"  -> intersection 1
-        "S_to_C3"    -> intersection 3
-
-    If no numeric suffix is found the lane goes to intersection 0 (default).
-
-    Parameters
-    ----------
-    leaders : dict {lane_id: vehicle_id | None}
-    num_intersections : int
-
-    Returns
-    -------
-    list of dicts, one per intersection
-    
-    if num_intersections == 1:
-        return [leaders]
-
-    buckets: List[Dict[str, Any]] = [{} for _ in range(num_intersections)]
-
-    for lane_id, vehicle_id in leaders.items():
-        # Try to extract the intersection index from the lane / edge name.
-        # Convention: "X_to_C{idx}" or "X_to_C{idx}_{lane_num}"
-        idx = 0
-        try:
-            # Find "C" in the lane id and read the digit that follows
-            c_pos = lane_id.index("_to_C")
-            after = lane_id[c_pos + len("_to_C"):]
-            # after might be "0", "0_1", "0_lane_2", etc.
-            digit_str = ""
-            for ch in after:
-                if ch.isdigit():
-                    digit_str += ch
-                else:
-                    break
-            if digit_str:
-                idx = int(digit_str) % num_intersections
-        except ValueError:
-            pass  # no "_to_C" found -> default to 0
-
-        if 0 <= idx < num_intersections:
-            buckets[idx][lane_id] = vehicle_id
-
-    return buckets
-"""
-
 def assign_lanes_to_intersections(
     leaders: Dict[str, Any],
     num_intersections: int,
@@ -264,43 +143,35 @@ def assign_lanes_to_intersections(
 ) -> List[Dict[str, Any]]:
     """
     Split the global leaders dict into one sub-dict per intersection.
- 
-    Matching strategy — each lane ID is checked against every junction ID:
-        Single "C":     "N_to_C_0"     contains "C"     -> intersection 0
-        Chain  "J0":    "N0_to_J0_0"   contains "J0"    -> intersection 0
-               "J1":    "S1_to_J1_0"   contains "J1"    -> intersection 1
-        Grid "J_0_1":   "N_0_1_to_J_0_1_0" contains "J_0_1" -> that intersection
- 
-    A lane is assigned to the FIRST junction whose ID appears in the lane string.
-    Lanes that don't match any junction go to intersection 0 (safety fallback).
- 
-    Parameters
-    ----------
-    leaders : dict {lane_id: vehicle_id | None}
-    num_intersections : int
-    junction_ids : list[str]  ordered junction IDs (from get_junction_ids)
- 
-    Returns
-    -------
-    list of dicts, one per intersection
+
+    A lane is INCOMING to a junction when the junction ID appears in
+    the DESTINATION part (after "_to_") of the lane name.
+
+    Outgoing lanes (destination is a border node N/S/E/W) are SKIPPED
+    rather than falling back to bucket 0.
     """
     if num_intersections == 1:
         return [dict(leaders)]
- 
+
     buckets: List[Dict[str, Any]] = [{} for _ in range(num_intersections)]
- 
+
     for lane_id, vehicle_id in leaders.items():
+        if "_to_" not in lane_id:
+            continue
+
+        dest_part = lane_id.split("_to_", 1)[1]
+
         assigned = False
         for idx, jid in enumerate(junction_ids):
-            # Check if this junction ID appears in the lane name
-            # Use "_to_{jid}" to avoid "J0" matching inside "J0_to_J1"
-            if f"_to_{jid}" in lane_id or f"_to_{jid}_" in lane_id:
+            if dest_part == jid or dest_part.startswith(jid + "_"):
                 buckets[idx][lane_id] = vehicle_id
                 assigned = True
                 break
+
+        # FIX: outgoing lanes are simply skipped — no fallback to bucket 0
         if not assigned:
-            buckets[0][lane_id] = vehicle_id  # safety fallback
- 
+            pass
+
     return buckets
 
 
@@ -318,23 +189,10 @@ def build_per_intersection_obs(
 ) -> List[Dict[str, Any]]:
     """
     Build one observation dict per intersection.
- 
+
     Single intersection -> full image (no crop needed).
-    Multiple intersections -> each agent gets a 50x50 image cropped to
-    its junction's bounding box (junction centre ± _CROP_RADIUS_M metres).
- 
-    Parameters
-    ----------
-    obs               : global observation from env.step() / env.reset()
-    env               : SumoEnvironment (access to observation_builder)
-    per_int_leaders   : list of per-intersection leader dicts
-    junction_ids      : ordered list of junction IDs (from get_junction_ids)
-    num_intersections : int
-    image_size        : int
- 
-    Returns
-    -------
-    list of obs dicts, one per intersection
+    Multiple intersections -> each agent gets a cropped image centred
+    on its junction.
     """
     if num_intersections == 1:
         return [{
@@ -342,10 +200,9 @@ def build_per_intersection_obs(
             "leaders": per_int_leaders[0],
             "state":   obs.get("state", {}),
         }]
- 
+
     result = []
     for i, (local_leaders, jid) in enumerate(zip(per_int_leaders, junction_ids)):
-        # Crop the image to this junction's bbox
         cropped_image = env.observation_builder.build_image_for_intersection(
             intersection_id = i,
             junction_id     = jid,
@@ -356,50 +213,36 @@ def build_per_intersection_obs(
             "leaders": local_leaders,
             "state":   obs.get("state", {}),
         })
- 
+
     return result
+
 
 # ------------------------------------------------------------------------------
 #  Multi-agent action combiner
 # ------------------------------------------------------------------------------
 
 def multi_agent_act(
-    agents:             List[IntersectionAgent],
-    call_managers:      List[AgentCallManager],
-    per_int_obs:        List[Dict[str, Any]],
+    agents:        List[IntersectionAgent],
+    call_managers: List[AgentCallManager],
+    per_int_obs:   List[Dict[str, Any]],
 ) -> Dict[str, int]:
     """
     Run each agent if its AgentCallManager says a new decision is needed,
     otherwise replay the agent's current held action.
- 
-    Parameters
-    ----------
-    agents         : one IntersectionAgent per intersection
-    call_managers  : one AgentCallManager per intersection
-    per_int_obs    : one observation dict per intersection (cropped image + local leaders)
- 
-    Returns
-    -------
-    combined_action : dict {lane_id: 0 | 1}
     """
     combined_action: Dict[str, int] = {}
 
-    # zip() pairs each agent with its specific bucket of lanes.
-    # If there is 1 agent, this loop runs 1 time.
-    # If there are 8 agents, this loop runs 8 times.
     for agent, manager, local_obs in zip(agents, call_managers, per_int_obs):
         local_leaders = local_obs["leaders"]
- 
+
         if manager.needs_new_decision(local_leaders):
-            # New vehicles at the intersection -> ask the agent
             local_action = agent.act(local_obs)
             manager.update(local_leaders, local_action)
         else:
-            # Nothing changed -> hold the previous decision
             local_action = manager.current_action()
- 
+
         combined_action.update(local_action)
- 
+
     return combined_action
 
 
@@ -419,29 +262,32 @@ def print_step(step: int, reward: float, obs: Dict, info: Dict) -> None:
         f"congestion={stats['congestion_index']:.2f}"
     )
 
+
 # ------------------------------------------------------------------------------
 # Visualization helper
 # ------------------------------------------------------------------------------
-def visualize_observations(step: int, global_obs: Dict[str, Any], per_int_obs: List[Dict[str, Any]]) -> None:
-    """
-    Displays the global image and the cropped images for each intersection.
-    """
-    import numpy as np  # Make sure NumPy is imported at the top of your file
+
+def visualize_observations(
+    step: int,
+    global_obs: Dict[str, Any],
+    per_int_obs: List[Dict[str, Any]],
+) -> None:
+    """Display the global image and the cropped images for each intersection."""
+    import numpy as np
     num_intersections = len(per_int_obs)
 
-    # Create a figure: 1 panel for the global image + 1 panel per intersection
-    fig, axes = plt.subplots(1, num_intersections + 1, figsize=(4 * (num_intersections + 1), 4))
+    fig, axes = plt.subplots(
+        1, num_intersections + 1,
+        figsize=(4 * (num_intersections + 1), 4),
+    )
 
-    # Safety check in case matplotlib returns a single object instead of an array
     if not isinstance(axes, (list, np.ndarray)):
         axes = [axes]
 
-    # 1. Global image (full network view)
     axes[0].imshow(global_obs["image"])
     axes[0].set_title(f"Global Network (Step {step})")
     axes[0].axis('off')
 
-    # 2. Local images (the individual view of each agent)
     for i, local_obs in enumerate(per_int_obs):
         ax = axes[i + 1]
         ax.imshow(local_obs["image"])
@@ -464,8 +310,16 @@ def main():
     num_intersections = SCENARIO["num_intersections"]
     intersection_type = SCENARIO["intersection_type"]
 
-    junction_ids = get_junction_ids(num_intersections)
+    # Guard: complex intersections are not supported by the 4-direction model
+    if intersection_type == "complex":
+        print(
+            "\n  WARNING: 'complex' intersection type has more than 4 arms.\n"
+            "  The pre-trained DQN model only supports 4 directions (N/E/W/S).\n"
+            "  Falling back to 'four_way'.\n"
+        )
+        intersection_type = "four_way"
 
+    junction_ids = get_junction_ids(num_intersections)
 
     # -- 1. Build the road network -----------------------------------------
     print("\n[1/5] Building road network...")
@@ -498,16 +352,13 @@ def main():
     )
     env.start()
 
-    # -- 4. Create agents and call managers : one per intersection -----------------------
+    # -- 4. Create agents (shared model) and call managers -----------------
     print(f"\n[4/5] Loading {num_intersections} agent(s) from '{MODEL_PATH}'...")
-    agents: List[IntersectionAgent] = [
-        IntersectionAgent(
-            model_path      = MODEL_PATH,
-            image_size      = IMAGE_SIZE,
-            intersection_id = i,
-        )
-        for i in range(num_intersections)
-    ]
+    agents: List[IntersectionAgent] = IntersectionAgent.create_agents(
+        count      = num_intersections,
+        model_path = MODEL_PATH,
+        image_size = IMAGE_SIZE,
+    )
     call_managers: List[AgentCallManager] = [
         AgentCallManager(intersection_id=i)
         for i in range(num_intersections)
@@ -517,26 +368,27 @@ def main():
 
     # -- 5. RL loop --------------------------------------------------------
     print(f"\n[5/5] Running RL loop (print every {PRINT_EVERY} steps)...")
- 
+
     obs = env.reset()
 
-    # Clear the intersection bbox cache so it's recomputed for this episode
     env.observation_builder.reset_bbox_cache()
     for mgr in call_managers:
         mgr.reset()
- 
+
     done = False
     total_reward = 0.0
- 
+    agent_steps  = 0
+
     print(f"  Initial observation — image shape: {obs['image'].shape}\n")
 
-
     while not done:
-        # Split leaders per intersection using junction ID matching
+        agent_steps += 1
+
+        # Split leaders per intersection
         per_int_leaders = assign_lanes_to_intersections(
             obs["leaders"], num_intersections, junction_ids
         )
- 
+
         # Build one cropped image per intersection
         per_int_obs = build_per_intersection_obs(
             obs               = obs,
@@ -546,25 +398,26 @@ def main():
             num_intersections = num_intersections,
             image_size        = IMAGE_SIZE,
         )
- 
+
         # Smart agent call + full per-lane action dict
         action = multi_agent_act(agents, call_managers, per_int_obs)
- 
-        # Step the environment
+
+        # Step the environment (multi-step internally)
         obs, reward, done, info = env.step(action)
         total_reward += reward
- 
+
         # Visualize at step 100 if enabled
         if info["step"] == 100 and SHOW_CROPPED_IMAGE:
             visualize_observations(info["step"], obs, per_int_obs)
- 
+
         if info["step"] % PRINT_EVERY == 0 or done:
             print_step(info["step"], reward, obs, info)
- 
+
     print(f"\n  Total episode reward (vehicles arrived): {total_reward:.0f}")
+    print(f"  Agent steps: {agent_steps}")
     print()
     env.statistics_collector.print_summary()
- 
+
     try:
         df = env.statistics_collector.to_dataframe()
         csv_path = os.path.join(
@@ -574,52 +427,10 @@ def main():
         print(f"  Results saved to: {csv_path}")
     except ImportError:
         print("  (Install pandas to export results to CSV)")
- 
+
     env.close()
     print("\nSimulation complete.")
 
 
 if __name__ == "__main__":
     main()
-
-
-# ------------------------------------------------------------------------------
-#  Placeholder agent
-#  -----------------
-#  This is where your AI model goes.
-#
-#  Input
-#  -----
-#  obs["image"]   ndarray (50, 50, 3) uint8
-#                 The RGB pixel map.  Each pixel = one vehicle.
-#                 Intensity = speed.  Colour = destination direction.
-#                 White = already past the intersection.
-#
-#  obs["leaders"] dict {lane_id: vehicle_id | None}
-#                 Which vehicle is the leader on each lane right now.
-#
-#  Output
-#  ------
-#  action : dict {lane_id: 0 | 1}
-#                 1 = allow the leader to go  (speed restored to SUMO default)
-#                 0 = stop the leader          (speed = 0)
-#
-#  Placeholder policy: let every leader go unconditionally (all 1s).
-# ------------------------------------------------------------------------------
-
-# def placeholder_agent(obs: Dict[str, Any]) -> Dict[str, int]:
-#     """
-#     Rule-based placeholder -> lets every leader pass.
-
-#     Replace the body of this function with your real model, e.g.:
-
-#         image  = obs["image"]                    # shape (50, 50, 3)
-#         tensor = preprocess(image)               # your preprocessing
-#         action = my_model.predict(tensor)        # {lane_id: 0|1}
-#         return action
-#     """
-#     action = {}
-#     for lane_id, vehicle_id in obs["leaders"].items():
-#         if vehicle_id is not None:
-#             action[lane_id] = 1   # go
-#     return action
