@@ -426,17 +426,6 @@ class ActionHandler:
             current_pos = traci.vehicle.getLanePosition(vid)
             if current_pos >= stop_pos:
                 return False
-            
-            # --- AJOUT : Calcul du point de non-retour ---
-            speed = traci.vehicle.getSpeed(vid)
-            # Distance de freinage = v^2 / (2 * decel). 
-            # Decel est de 4.5 dans ton demand_generator.
-            braking_distance = (speed ** 2) / (2 * 4.5)
-            
-            # Si la distance nécessaire pour freiner dépasse l'espace disponible,
-            # on refuse l'ordre de stop (la voiture passe "au orange")
-            if current_pos + braking_distance > stop_pos:
-                return False
 
             for stop in traci.vehicle.getNextStops(vid):
                 if stop[0].startswith(road_id):
