@@ -1,4 +1,4 @@
-# traffic_sim/sumo_env/reward.py
+# traffic_sim/env/reward.py
 """
 RewardCalculator
 ================
@@ -29,7 +29,7 @@ Three reward types are supported (configurable at environment creation):
 
 Usage
 -----
-    from traffic_sim.sumo_env.reward import RewardCalculator
+    from traffic_sim.env.reward import RewardCalculator
 
     calc = RewardCalculator(reward_type="combined",
                             arrived_weight=1.0,

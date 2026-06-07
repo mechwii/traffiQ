@@ -24,21 +24,28 @@ Bit layout (teacher's training order, mapped to our directions)
   If the network has fewer than 4 incoming directions (e.g. T-junction
   with 3 arms), the extra bits are silently ignored.
 
-Safety filter
--------------
+Safety filter (route-aware)
+---------------------------
   After the model produces go/stop bits per direction, _safety_filter()
-  removes conflicting simultaneous "go" decisions.  Two directions can
-  safely cross at the same time only if they are PARALLEL (N+S or E+W).
-  Perpendicular pairs (N+E, N+W, S+E, S+W) are NOT safe — the second
-  one in priority order is set to STOP.
+  removes conflicting simultaneous "go" decisions.
+
+  The filter is ROUTE-AWARE: it queries each vehicle's route via TraCI
+  to determine whether two vehicles' paths actually cross inside the
+  junction.  This is less restrictive than the old direction-only check
+  (which blocked ALL perpendicular pairs) and closer to the teacher's
+  security_matrice.npy behaviour.
+
+  Conflict rules (standard right-hand traffic):
+    - Parallel directions (N+S or E+W) NEVER conflict when both go
+      straight or both turn right.
+    - Right turns generally don't conflict with perpendicular traffic
+      (they merge rather than cross).
+    - Left turns conflict with oncoming straight and perpendicular
+      through-traffic.
+    - When route information is unavailable, the filter falls back to
+      the conservative direction-only check.
 
   Priority order: N > E > S > W  (matches teacher's convention).
-
-  This replaces the teacher's security_matrice.npy lookup with a
-  conservative rule-based check.  It is slightly more restrictive
-  (the matrix also allows some perpendicular turns that don't actually
-  cross) but is safe for all network types without needing the numpy
-  file.
 
 Model sharing
 -------------
@@ -63,7 +70,7 @@ Usage
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import numpy as np
 
 try:
@@ -90,14 +97,46 @@ _DIRECTION_BIT_INDEX: Dict[str, int] = {
     "S": 6,
 }
 
-# Direction pairs that can safely cross simultaneously (parallel traffic)
-_SAFE_DIRECTION_PAIRS = {
+# Direction pairs that can ALWAYS safely cross (parallel traffic, same axis)
+_ALWAYS_SAFE_PAIRS = {
     frozenset({"N", "S"}),
     frozenset({"E", "W"}),
 }
 
 # Priority order for resolving conflicts (higher priority kept first)
 _PRIORITY_ORDER = ["N", "E", "S", "W"]
+
+# Opposite directions
+_OPPOSITE: Dict[str, str] = {"N": "S", "S": "N", "E": "W", "W": "E"}
+
+# Turn types: (entry_direction, exit_direction) -> "straight" | "left" | "right"
+# For right-hand traffic (driving on the right side of the road):
+#   Entering from N, exiting to S = straight
+#   Entering from N, exiting to W = right turn
+#   Entering from N, exiting to E = left turn
+_TURN_TYPE: Dict[Tuple[str, str], str] = {
+    ("N", "S"): "straight", ("N", "W"): "right", ("N", "E"): "left",
+    ("S", "N"): "straight", ("S", "E"): "right", ("S", "W"): "left",
+    ("E", "W"): "straight", ("E", "S"): "right", ("E", "N"): "left",
+    ("W", "E"): "straight", ("W", "N"): "right", ("W", "S"): "left",
+}
+
+# Route-aware conflict table.
+# Key: (turn_type_A, turn_type_B)  Value: True if they conflict.
+# Two RIGHT turns never conflict (they merge into different lanes).
+# A RIGHT + STRAIGHT is safe if they're not from the same axis.
+# LEFT turns conflict with almost everything from perpendicular dirs.
+_PERPENDICULAR_CONFLICT: Dict[Tuple[str, str], bool] = {
+    ("right",    "right"):    False,  # both merging, no crossing
+    ("right",    "straight"): False,  # right turn merges, doesn't cross
+    ("right",    "left"):     True,   # left turn crosses right's exit path
+    ("straight", "right"):    False,  # symmetric
+    ("straight", "straight"): True,   # perpendicular straights cross
+    ("straight", "left"):     True,   # left turn crosses straight
+    ("left",     "right"):    True,   # symmetric
+    ("left",     "straight"): True,   # symmetric
+    ("left",     "left"):     True,   # both crossing, conflict
+}
 
 # Regex to strip the trailing lane index from a lane ID
 _LANE_INDEX_RE = re.compile(r"_\d+$")
@@ -121,7 +160,7 @@ def _lane_to_direction(lane_id: str) -> Optional[str]:
     origin, dest_raw = lane_id.split("_to_", 1)
     dest_edge = _strip_lane_index(dest_raw)
 
-    # 1. Border node origin
+    # 1. Border node origin (single intersection: "N_to_C", multi: "N0_to_J0")
     for d in _DIRECTIONS:
         if origin == d:
             return d
@@ -139,10 +178,12 @@ def _lane_to_direction(lane_id: str) -> Optional[str]:
     o_nums = _extract_nums(origin)
     d_nums = _extract_nums(dest_edge)
 
+    # Linear chain: J0 -> J1  (single index)
     if len(o_nums) == 1 and len(d_nums) == 1:
         if o_nums[0] < d_nums[0]: return "W"
         if o_nums[0] > d_nums[0]: return "E"
 
+    # Grid: J_0_0 -> J_0_1  (row, col indices)
     elif len(o_nums) == 2 and len(d_nums) == 2:
         o_row, o_col = o_nums
         d_row, d_col = d_nums
@@ -151,6 +192,33 @@ def _lane_to_direction(lane_id: str) -> Optional[str]:
         if o_row < d_row: return "S"
         if o_row > d_row: return "N"
 
+    # Fallback: could not determine direction
+    return None
+
+
+def _get_vehicle_exit_direction(vid: str) -> Optional[str]:
+    """
+    Determine the exit direction of a vehicle from its route.
+
+    Looks at the LAST edge in the vehicle's route and infers the
+    border-node direction from its name.
+
+    Returns one of "N", "S", "E", "W" or None if undetermined.
+    """
+    if not TRACI_AVAILABLE:
+        return None
+    try:
+        route = traci.vehicle.getRoute(vid)
+        if not route:
+            return None
+        last_edge = route[-1]
+        # Last edge goes toward a border node: "C_to_N", "J0_to_S0", etc.
+        if "_to_" in last_edge:
+            dest_node = last_edge.split("_to_")[-1]
+            if dest_node and dest_node[0] in ("N", "S", "E", "W"):
+                return dest_node[0]
+    except Exception:
+        pass
     return None
 
 
@@ -253,7 +321,7 @@ class IntersectionAgent:
           1. CNN forward pass -> integer action 0..255
           2. Decode to 8-bit binary -> per-direction go/stop
           3. Map direction bits to lane IDs
-          4. Safety filter: remove conflicting perpendicular "go" pairs
+          4. Safety filter: remove conflicting "go" pairs (route-aware)
           5. Deadlock guard: if all lanes stopped for too long, release
              the longest-waiting leader
         """
@@ -279,8 +347,8 @@ class IntersectionAgent:
                 continue
             action[lane_id] = direction_bits[direction]
 
-        # 4. Safety filter: prevent conflicting perpendicular "go" actions
-        action = self._safety_filter(action)
+        # 4. Safety filter: prevent conflicting "go" pairs (route-aware)
+        action = self._safety_filter(action, leaders)
 
         # 5. Deadlock guard: if ALL are stopped and someone is waiting
         #    too long, release the longest-waiting leader
@@ -290,51 +358,116 @@ class IntersectionAgent:
         return action
 
     # ------------------------------------------------------------------ #
-    #  Safety filter                                                       #
+    #  Route-aware safety filter                                           #
     # ------------------------------------------------------------------ #
 
-    def _safety_filter(self, action: Dict[str, int]) -> Dict[str, int]:
+    def _safety_filter(
+        self,
+        action: Dict[str, int],
+        leaders: Dict[str, Optional[str]],
+    ) -> Dict[str, int]:
         """
-        Remove conflicting go-actions for perpendicular directions.
+        Remove conflicting go-actions using route-aware conflict detection.
 
-        Only parallel direction pairs (N+S, E+W) are allowed to cross
-        simultaneously.  When a perpendicular conflict is detected,
-        the lower-priority direction is set to STOP.
+        For each pair of "go" directions, the filter:
+          1. Checks if they are parallel (N+S or E+W) -> always safe.
+          2. For perpendicular pairs, queries each vehicle's route via
+             TraCI to determine turn type (straight, left, right).
+          3. Uses the conflict table to decide if the pair is safe.
+          4. Falls back to conservative blocking if route info is
+             unavailable.
 
-        This is a conservative replacement for the teacher's
-        security_matrice.npy — it may block some turns that would
-        actually be safe, but it never allows unsafe crossings.
+        This is less restrictive than the old direction-only check
+        (which blocked ALL perpendicular pairs) and closer to the
+        teacher's security_matrice.npy behaviour.
         """
-        # Group "go" lanes by direction
-        go_by_dir: Dict[str, List[str]] = {}
+        # Group "go" lanes by direction, with their vehicle IDs
+        go_by_dir: Dict[str, List[Tuple[str, Optional[str]]]] = {}
         for lane_id, go_val in action.items():
             if go_val == 1:
                 d = _lane_to_direction(lane_id)
                 if d:
-                    go_by_dir.setdefault(d, []).append(lane_id)
+                    vid = leaders.get(lane_id)
+                    go_by_dir.setdefault(d, []).append((lane_id, vid))
 
         if len(go_by_dir) <= 1:
             return action   # 0 or 1 direction active -> no conflict
 
         # Greedily accept directions in priority order
-        accepted: set = set()
+        accepted: Dict[str, str] = {}  # direction -> turn_type
+
         for d in _PRIORITY_ORDER:
             if d not in go_by_dir:
                 continue
-            is_safe = all(
-                frozenset({d, a}) in _SAFE_DIRECTION_PAIRS
-                for a in accepted
-            )
+
+            # Determine turn type for this direction's leader
+            turn_type = self._get_turn_type(d, go_by_dir[d])
+
+            # Check against all already-accepted directions
+            is_safe = True
+            for accepted_d, accepted_turn in accepted.items():
+                if not self._pair_is_safe(d, turn_type, accepted_d, accepted_turn):
+                    is_safe = False
+                    break
+
             if is_safe:
-                accepted.add(d)
+                accepted[d] = turn_type
 
         # Set rejected directions to STOP
-        for d, lane_ids in go_by_dir.items():
+        for d, lane_entries in go_by_dir.items():
             if d not in accepted:
-                for lid in lane_ids:
+                for lid, _ in lane_entries:
                     action[lid] = 0
 
         return action
+
+    def _get_turn_type(
+        self,
+        entry_dir: str,
+        lane_entries: List[Tuple[str, Optional[str]]],
+    ) -> str:
+        """
+        Determine the turn type for a direction's leader vehicle.
+
+        Queries TraCI for the vehicle's route to find the exit direction.
+        Falls back to "straight" (most conservative for conflict checking)
+        if route info is unavailable.
+        """
+        for _, vid in lane_entries:
+            if vid is None:
+                continue
+            exit_dir = _get_vehicle_exit_direction(vid)
+            if exit_dir is not None and exit_dir != entry_dir:
+                turn = _TURN_TYPE.get((entry_dir, exit_dir))
+                if turn is not None:
+                    return turn
+        # Fallback: assume straight (most likely to conflict)
+        return "straight"
+
+    @staticmethod
+    def _pair_is_safe(
+        dir_a: str, turn_a: str,
+        dir_b: str, turn_b: str,
+    ) -> bool:
+        """
+        Return True if two directions can safely cross simultaneously.
+
+        Parallel directions (N+S, E+W) are always safe.
+        For perpendicular directions, uses the route-aware conflict table.
+        """
+        pair = frozenset({dir_a, dir_b})
+
+        # Parallel directions: always safe
+        if pair in _ALWAYS_SAFE_PAIRS:
+            return True
+
+        # Perpendicular directions: check turn-type conflict table
+        conflicts = _PERPENDICULAR_CONFLICT.get((turn_a, turn_b))
+        if conflicts is not None:
+            return not conflicts
+
+        # Unknown turn combo — block to be safe
+        return False
 
     # ------------------------------------------------------------------ #
     #  Deadlock guard                                                      #
@@ -371,8 +504,6 @@ class IntersectionAgent:
                 speed = traci.vehicle.getSpeed(vid)
                 if speed < 0.1:
                     any_stopped = True
-                # Use waiting time if available, else use 1.0 as
-                # a tiebreaker so we still pick the "first" vehicle
                 wait = traci.vehicle.getAccumulatedWaitingTime(vid)
                 if wait < 0.1:
                     wait = 1.0   # setStop vehicles may report 0

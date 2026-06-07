@@ -76,9 +76,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from traffic_sim.network.network_builder   import NetworkBuilder
 from traffic_sim.network.demand_generator  import DemandGenerator
-from traffic_sim.sumo_env.sumo_environment import SumoEnvironment
+from traffic_sim.env.sumo_environment import SumoEnvironment
 from traffic_sim.agents.intersection_agent import IntersectionAgent
 from traffic_sim.agents.agent_call_manager import AgentCallManager
+from plot_result import plot_metrics
 
 # ------------------------------------------------------------------------------
 #  Configuration
@@ -97,7 +98,7 @@ CONFIGS_DIR         = "configs"
 PRINT_EVERY         = 50
 
 # Path to the pre-trained SavedModel directory
-MODEL_PATH = os.path.join(".", "traffic_sim", "save_model")
+MODEL_PATH = os.path.join(".", "traffic_sim", "models" ,"save_model")
 
 # Observation image size — must match what the model was trained on
 IMAGE_SIZE = 50
@@ -105,6 +106,8 @@ SHOW_CROPPED_IMAGE = True
 
 DEST_COLORS: Optional[Dict] = None
 INTERSECTION_OUTGOING: Optional[set] = None
+
+REWARD_TYPE = "combined"  # "throughput" | "waiting_time" | "combined"
 
 
 # ------------------------------------------------------------------------------
@@ -349,6 +352,7 @@ def main():
         image_size    = IMAGE_SIZE,
         dest_colors   = DEST_COLORS,
         intersection_outgoing = INTERSECTION_OUTGOING,
+        reward_type = REWARD_TYPE,  # "throughput" | "waiting_time" | "combined"
     )
     env.start()
 
@@ -413,7 +417,7 @@ def main():
         if info["step"] % PRINT_EVERY == 0 or done:
             print_step(info["step"], reward, obs, info)
 
-    print(f"\n  Total episode reward (vehicles arrived): {total_reward:.0f}")
+    print(f"\n  Total episode reward ({REWARD_TYPE}): {total_reward:.0f}")
     print(f"  Agent steps: {agent_steps}")
     print()
     env.statistics_collector.print_summary()
@@ -424,6 +428,7 @@ def main():
             os.path.dirname(route_file), f"results_{DEMAND_LEVEL}.csv"
         )
         df.to_csv(csv_path, index=False)
+        plot_metrics(csv_path)
         print(f"  Results saved to: {csv_path}")
     except ImportError:
         print("  (Install pandas to export results to CSV)")

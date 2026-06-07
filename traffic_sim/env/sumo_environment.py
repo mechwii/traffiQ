@@ -1,4 +1,4 @@
-# traffic_sim/sumo_env/sumo_environment.py
+# traffic_sim/env/environment.py
 """
 SumoEnvironment
 
@@ -36,6 +36,9 @@ Follower control  (matching the teacher's set_loaded_vehicle)
   using traci.vehicle.setStop().  This prevents followers from pushing
   into the intersection uncontrolled.
 
+  ALL follower-control and action-application logic is delegated to
+  ActionHandler — SumoEnvironment does NOT duplicate it.
+
 --------------------------------------------------------------------------
 Leader actions  (matching the teacher's set_leaders_actions2)
 --------------------------------------------------------------------------
@@ -49,6 +52,15 @@ Speed mode  (matching the teacher's set_speed_mode)
   Mode 55 = binary 110111 = disable right-of-way check at junctions
   (bit 3).  Applied to all newly loaded vehicles each step so the AI
   agent controls who crosses, not SUMO's default priority rules.
+
+--------------------------------------------------------------------------
+Reward  (configurable via RewardCalculator)
+--------------------------------------------------------------------------
+  The reward is computed by RewardCalculator, which supports four modes:
+    "arrived"    -> +1 per vehicle completing its route
+    "waiting"    -> negative mean waiting time
+    "congestion" -> negative congestion index
+    "combined"   -> weighted sum of arrived, waiting, and collisions
 """
 
 import os
@@ -78,9 +90,7 @@ from .state import StateExtractor
 from .actions import ActionHandler
 from .statistics import StatisticsCollector
 from .observation import ObservationBuilder
-
-# Speed mode: 55 = binary 110111 = disable junction right-of-way (bit 3)
-_SPEED_MODE_AI_CONTROL = 55
+from .reward import RewardCalculator
 
 
 class SumoEnvironment:
@@ -119,6 +129,15 @@ class SumoEnvironment:
         Edge IDs drawn white in the observation image.
     bbox : tuple | None
         World-space bounding box: ((xmin, ymin), (xmax, ymax)).
+    reward_type : str
+        Reward calculation mode: "arrived", "waiting", "congestion",
+        or "combined".  Default is "arrived".
+    arrived_weight : float
+        Weight on the arrived-vehicles term (combined mode only).
+    waiting_weight : float
+        Weight on the mean-waiting-time penalty (combined mode only).
+    collision_coef : float
+        Penalty multiplied by the number of collisions (combined mode only).
     """
 
     def __init__(
@@ -135,6 +154,10 @@ class SumoEnvironment:
         dest_colors:            Optional[Dict]  = None,
         intersection_outgoing:  Optional[set]   = None,
         bbox:                   Optional[Any]   = None,
+        reward_type:            str             = "arrived",
+        arrived_weight:         float           = 1.0,
+        waiting_weight:         float           = 0.01,
+        collision_coef:         float           = 5.0,
     ):
         if not os.path.isfile(net_file):
             raise FileNotFoundError(
@@ -160,6 +183,12 @@ class SumoEnvironment:
         self._intersection_outgoing = intersection_outgoing
         self._bbox                  = bbox
 
+        # Reward configuration
+        self._reward_type    = reward_type
+        self._arrived_weight = arrived_weight
+        self._waiting_weight = waiting_weight
+        self._collision_coef = collision_coef
+
         # Resolve SUMO binary
         sumo_home = sumo_home or os.environ.get("SUMO_HOME", "")
         if sumo_home:
@@ -181,18 +210,20 @@ class SumoEnvironment:
         self.action_handler:       Optional[ActionHandler]        = None
         self.statistics_collector: Optional[StatisticsCollector]  = None
         self.observation_builder:  Optional[ObservationBuilder]   = None
+        self.reward_calculator:    Optional[RewardCalculator]     = None
 
         self._started = False
 
         print(
             f"[SumoEnvironment] Initialised\n"
-            f"  net_file   : {self.net_file}\n"
-            f"  route_file : {self.route_file}\n"
-            f"  gui        : {self.use_gui}\n"
-            f"  step_length: {self.step_length}s\n"
-            f"  max_steps  : {self.max_steps}\n"
-            f"  port       : {self.port}\n"
-            f"  image_size : {self._image_size}px\n"
+            f"  net_file    : {self.net_file}\n"
+            f"  route_file  : {self.route_file}\n"
+            f"  gui         : {self.use_gui}\n"
+            f"  step_length : {self.step_length}s\n"
+            f"  max_steps   : {self.max_steps}\n"
+            f"  port        : {self.port}\n"
+            f"  image_size  : {self._image_size}px\n"
+            f"  reward_type : {self._reward_type}\n"
         )
 
     # ================================================================== #
@@ -202,6 +233,7 @@ class SumoEnvironment:
     def start(self) -> None:
         """
         Validate the environment and prepare the SUMO command.
+
         Does NOT launch SUMO — that happens in reset().
         """
         if not TRACI_AVAILABLE:
@@ -253,6 +285,12 @@ class SumoEnvironment:
             intersection_outgoing = self._intersection_outgoing,
             bbox                  = self._bbox,
         )
+        self.reward_calculator    = RewardCalculator(
+            reward_type    = self._reward_type,
+            arrived_weight = self._arrived_weight,
+            waiting_weight = self._waiting_weight,
+            collision_coef = self._collision_coef,
+        )
 
         obs = self._build_observation()
         print(
@@ -269,6 +307,7 @@ class SumoEnvironment:
     def step(
         self,
         action: Any = None,
+        simulation_time: Optional[float] = None,
     ) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
         """
         Apply an action, advance the simulation by ONE step, and return
@@ -283,7 +322,7 @@ class SumoEnvironment:
         main.py handles re-triggering only when meaningful changes occur.
 
         The critical fixes from the teacher's code are applied WITHIN
-        each single step:
+        each single step, ALL delegated to ActionHandler:
           - Follower control  (non-leaders stopped before intersection)
           - setStop / release (leaders controlled via setStop, not setSpeed)
           - Speed mode 55     (disable SUMO junction right-of-way)
@@ -293,20 +332,33 @@ class SumoEnvironment:
         action : dict | None
             {lane_id: 0 | 1}  where 1=go, 0=stop.
             Pass None for free-running SUMO (no external control).
+        simulation_time : float | None
+            Override for max simulation time (seconds).  If provided,
+            overrides the max_steps set at construction.  Matches the
+            spec signature: step(action, simulation_time).
 
         Returns
         -------
         observation : dict
-        reward      : float   (vehicles that arrived this step)
+        reward      : float
         done        : bool
         info        : dict
         """
         self._check_running()
 
-        # ---- 1. Set speed mode for newly loaded vehicles ----
-        self._set_speed_modes_loaded()
+        # Override max_steps if simulation_time is provided
+        effective_max_steps = (
+            simulation_time if simulation_time is not None
+            else self.max_steps
+        )
 
-        # ---- 2. Apply action ----
+        # ---- 1. Refresh ActionHandler cache ----
+        self.action_handler.refresh_cache()
+
+        # ---- 2. Set speed mode for newly loaded vehicles ----
+        self.action_handler.set_speed_modes_loaded()
+
+        # ---- 3. Apply action ----
         incoming_leaders = None
 
         if action is not None and isinstance(action, dict) and self._looks_binary(action):
@@ -315,34 +367,34 @@ class SumoEnvironment:
             incoming_leaders = self._filter_incoming_leaders(all_leaders)
 
             # Stop all non-leader vehicles on incoming edges
-            self._stop_non_leaders(incoming_leaders)
+            self.action_handler.stop_non_leaders(incoming_leaders)
 
             # Apply go/stop to leaders via setStop
-            self._apply_binary_action(action, incoming_leaders)
+            self.action_handler.apply_binary_action(action, incoming_leaders)
 
         elif action is not None:
             # Legacy path: speed dict or list of action dicts
             self.action_handler.set_action(action)
 
-        # ---- 3. Advance simulation by ONE step ----
+        # ---- 4. Advance simulation by ONE step ----
         traci.simulationStep()
         self._current_step += 1
 
         # Set speed mode for vehicles that just loaded during this step
-        self._set_speed_modes_loaded()
+        self.action_handler.set_speed_modes_loaded()
 
         # Stop vehicles that just departed and are not leaders
         if incoming_leaders is not None:
-            self._stop_departed_non_leaders(incoming_leaders)
+            self.action_handler.stop_departed_non_leaders(incoming_leaders)
 
-        # ---- 4. Reward: vehicles that completed their route ----
-        reward = float(traci.simulation.getArrivedNumber())
+        # ---- 5. Reward: computed by RewardCalculator ----
+        reward = self.reward_calculator.compute()
 
-        # ---- 5. Build observation ----
+        # ---- 6. Build observation ----
         obs  = self._build_observation()
-        done = self._is_done()
+        done = self._is_done(effective_max_steps)
 
-        # ---- 6. Collect statistics ----
+        # ---- 7. Collect statistics ----
         stats = self.statistics_collector.statistics()
 
         info = {
@@ -416,165 +468,6 @@ class SumoEnvironment:
         return self._simulation_running
 
     # ================================================================== #
-    #  Binary action helpers                                               #
-    # ================================================================== #
-
-    def _safe_set_stop(self, vid: str, road_id: str, stop_pos: float) -> bool:
-        """
-        Set a stop for *vid* at *stop_pos* on *road_id*, but ONLY if:
-          1. The vehicle hasn't already passed that position.
-          2. The vehicle doesn't already have a stop queued on this edge.
-
-        Without these checks, SUMO prints
-            "stop for vehicle X on lane Y is not downstream the current route"
-        to stderr even though the Python TraCIException is caught.
-
-        Returns True if the stop was successfully set.
-        """
-        try:
-            # Guard 1: vehicle already past the stop position?
-            current_pos = traci.vehicle.getLanePosition(vid)
-            if current_pos >= stop_pos:
-                return False
-
-            # Guard 2: vehicle already has a stop on this edge?
-            for stop in traci.vehicle.getNextStops(vid):
-                # stop is a tuple: (lane, endPos, stoppingPlaceID, flags, duration, until)
-                # lane format: "edge_id_laneIndex"  -> check if it starts with road_id
-                if stop[0].startswith(road_id):
-                    return False
-
-            traci.vehicle.setStop(vid, road_id, stop_pos)
-            return True
-
-        except traci.TraCIException:
-            return False
-
-    def _apply_binary_action(
-        self,
-        action: Dict[str, int],
-        leaders: Dict[str, Optional[str]],
-    ) -> None:
-        """
-        Apply a discrete {lane_id: 0|1} action to leader vehicles.
-
-        Uses traci.vehicle.setStop() to match the teacher's reference:
-          - action=0 -> queue a stop 10 m before edge end
-          - action=1 -> release any existing stop, return to SUMO control
-
-        Parameters
-        ----------
-        action  : {lane_id: 0|1}
-        leaders : {lane_id: vehicle_id|None}  (pre-queried, NOT re-fetched)
-        """
-        for lane_id, go in action.items():
-            vehicle_id = leaders.get(lane_id)
-            if vehicle_id is None:
-                continue
-
-            try:
-                road_id = traci.vehicle.getRoadID(vehicle_id)
-                if road_id.startswith(":"):
-                    continue
-
-                lane   = traci.vehicle.getLaneID(vehicle_id)
-                length = traci.lane.getLength(lane)
-                stop_pos = max(1.0, length - 10.0)
-
-                if go == 1:
-                    # Release: remove existing stop, hand back to SUMO
-                    traci.vehicle.setColor(vehicle_id, (0, 255, 0))
-                    if traci.vehicle.getNextStops(vehicle_id):
-                        traci.vehicle.setStop(
-                            vehicle_id, road_id, stop_pos, duration=0
-                        )
-                    traci.vehicle.setSpeed(vehicle_id, -1)
-                else:
-                    # Stop before intersection
-                    traci.vehicle.setColor(vehicle_id, (255, 0, 0))
-                    self._safe_set_stop(vehicle_id, road_id, stop_pos)
-
-            except traci.TraCIException:
-                pass
-
-    def _stop_non_leaders(
-        self,
-        incoming_leaders: Dict[str, Optional[str]],
-    ) -> None:
-        """
-        Stop ALL active non-leader vehicles on incoming edges.
-
-        Called once per step before actions are applied.  Non-leaders are
-        stopped 10 m before the edge end via setStop().  Vehicles on
-        internal edges (inside junction) or outgoing edges (past the
-        intersection) are left alone.
-
-        Matches the teacher's set_loaded_vehicle().
-        """
-        leader_vids = {vid for vid in incoming_leaders.values()
-                       if vid is not None}
-
-        for vid in traci.vehicle.getIDList():
-            if vid in leader_vids:
-                continue
-            try:
-                road_id = traci.vehicle.getRoadID(vid)
-                if road_id.startswith(":"):
-                    continue
-                if self._is_outgoing_edge(road_id):
-                    continue
-
-                lane   = traci.vehicle.getLaneID(vid)
-                length = traci.lane.getLength(lane)
-                stop_pos = max(1.0, length - 10.0)
-                if self._safe_set_stop(vid, road_id, stop_pos):
-                    traci.vehicle.setColor(vid, (255, 200, 0))
-            except traci.TraCIException:
-                pass
-
-    def _stop_departed_non_leaders(
-        self,
-        incoming_leaders: Dict[str, Optional[str]],
-    ) -> None:
-        """
-        Stop vehicles that just departed this step and are not leaders.
-
-        Called AFTER simulationStep() to catch new arrivals that entered
-        the network during this step.
-        """
-        leader_vids = {vid for vid in incoming_leaders.values()
-                       if vid is not None}
-
-        for vid in traci.simulation.getDepartedIDList():
-            if vid in leader_vids:
-                continue
-            try:
-                road_id = traci.vehicle.getRoadID(vid)
-                if road_id.startswith(":"):
-                    continue
-                lane   = traci.vehicle.getLaneID(vid)
-                length = traci.lane.getLength(lane)
-                stop_pos = max(1.0, length - 10.0)
-                if self._safe_set_stop(vid, road_id, stop_pos):
-                    traci.vehicle.setColor(vid, (255, 200, 0))
-            except traci.TraCIException:
-                pass
-
-    def _set_speed_modes_loaded(self) -> None:
-        """
-        Set speed mode to 55 for all newly loaded vehicles.
-
-        Mode 55 = binary 110111 = disable junction right-of-way (bit 3).
-        This gives the AI agent full control over who crosses.
-        Matches the teacher's set_speed_mode().
-        """
-        for vid in traci.simulation.getLoadedIDList():
-            try:
-                traci.vehicle.setSpeedMode(vid, _SPEED_MODE_AI_CONTROL)
-            except traci.TraCIException:
-                pass
-
-    # ================================================================== #
     #  Leader / edge helpers                                               #
     # ================================================================== #
 
@@ -585,16 +478,13 @@ class SumoEnvironment:
         """
         Keep only lanes that are INCOMING to an intersection.
 
-        Filters out:
-          - Internal SUMO lanes (id starts with ':')
-          - Outgoing lanes (destination is a border node N/S/E/W)
+        Since get_leaders() now filters out outgoing lanes at the source,
+        this method only needs to handle edge cases (internal lanes that
+        might slip through).
         """
         incoming: Dict[str, Optional[str]] = {}
         for lane_id, vid in all_leaders.items():
             if lane_id.startswith(":"):
-                continue
-            edge_id = self._lane_to_edge(lane_id)
-            if self._is_outgoing_edge(edge_id):
                 continue
             incoming[lane_id] = vid
         return incoming
@@ -652,14 +542,15 @@ class SumoEnvironment:
     #  Episode termination                                                 #
     # ================================================================== #
 
-    def _is_done(self) -> bool:
+    def _is_done(self, max_steps: Optional[float] = None) -> bool:
         """
         Return True when the episode should end.
           - simulation time >= max_steps
           - no more vehicles expected AND simulation time > 60s
         """
+        effective_max = max_steps if max_steps is not None else self.max_steps
         sim_time = traci.simulation.getTime()
-        if sim_time >= self.max_steps:
+        if sim_time >= effective_max:
             return True
         if sim_time > 60 and traci.simulation.getMinExpectedNumber() == 0:
             return True

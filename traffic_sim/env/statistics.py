@@ -1,4 +1,4 @@
-# traffic_sim/sumo_env/statistics.py
+# traffic_sim/env/statistics.py
 """
 StatisticsCollector
 

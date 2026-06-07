@@ -1,4 +1,4 @@
-# traffic_sim/sumo_env/state.py
+# traffic_sim/env/state.py
 """
 StateExtractor
 

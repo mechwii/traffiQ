@@ -1,4 +1,4 @@
-# traffic_sim/sumo_env/observation.py
+# traffic_sim/env/observation.py
 """
 ObservationBuilder
 ==================
@@ -59,8 +59,9 @@ try:
 except ImportError:
     TRACI_AVAILABLE = False
 
-MAX_SPEED_MS   = 14.0   # m/s -> pixel intensity normalisation
-_CROP_RADIUS_M = 50.0  # metres around junction centre for cropped image
+MAX_SPEED_MS   = 13.89  # m/s -> pixel intensity normalisation (matches network_builder.MAX_SPEED)
+# _CROP_RADIUS_M = 50.0  # metres around junction centre for cropped image
+_CROP_RADIUS_M = 100.0  # metres around junction centre for cropped image (increased for multi-intersection layouts)
 
 # Canonical single-intersection dest_colors keys, one per direction letter
 _DIRECTION_TO_COLOR_KEY: Dict[str, str] = {

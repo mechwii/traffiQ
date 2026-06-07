@@ -281,7 +281,7 @@ class _LayoutGenerator:
     
     def _linear_chain(self, count: int) -> Tuple[List[Node], List[Edge]]:
         """
-        Buidl count intersections in a horizontal line.
+        Build count intersections in a horizontal line.
         Spacing between intersections is 2 * ROAD_LENGTH.
         """
 
