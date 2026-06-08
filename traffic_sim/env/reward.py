@@ -4,42 +4,41 @@ RewardCalculator
 ================
 Computes the scalar reward signal returned to the AI agent at every step.
 
-Three reward types are supported (configurable at environment creation):
+We support four reward strategies here. I kept the teacher's reference 
+("arrived"), but added a few others ("waiting", "congestion", "combined") 
+to give us more flexibility during training depending on what we want to optimize.
 
+Reward types:
   "arrived"
       +1 for every vehicle that completed its route this step.
-      Simple, sparse, directly optimises throughput.
-      → Mirrors the teacher's reference implementation.
+      Simple, sparse, and directly optimizes throughput. 
+      This is the exact logic from the teacher's reference.
 
   "waiting"
-      - (mean accumulated waiting time across all active vehicles).
-      Dense signal; encourages the agent to reduce queue lengths.
+      Negative mean accumulated waiting time across all active vehicles.
+      Dense signal that forces the agent to actively reduce queue lengths.
 
   "congestion"
-      - (fraction of vehicles that are stopped).
-      Dense; ranges from 0 (free flow) to -1 (full gridlock).
+      Negative fraction of vehicles that are currently stopped.
+      Dense signal ranging from 0 (free flow) to -1 (full gridlock).
 
-  "combined"   ← DEFAULT
-      arrived_weight  * n_arrived
-    - waiting_weight  * mean_waiting_time
-    - collision_coef  * n_collisions
-
+  "combined" (Default)
       Balances throughput, queue length, and safety.
-      All weights are configurable.
+      Calculation: 
+      (arrived_weight * n_arrived) - (waiting_weight * mean_waiting) - (collision_coef * n_collisions)
 
-Usage
------
+Usage:
     from traffic_sim.env.reward import RewardCalculator
 
-    calc = RewardCalculator(reward_type="combined",
-                            arrived_weight=1.0,
-                            waiting_weight=0.01,
-                            collision_coef=5.0)
+    calc = RewardCalculator(
+        reward_type="combined",
+        arrived_weight=1.0,
+        waiting_weight=0.01,
+        collision_coef=5.0
+    )
+    reward = calc.compute()  # Call once per step while TraCI is active
 
-    reward = calc.compute()   # call once per step while TraCI is active
-
-TraCI calls used
-----------------
+TraCI calls used:
     traci.vehicle.getIDList()
     traci.vehicle.getSpeed(vid)
     traci.vehicle.getAccumulatedWaitingTime(vid)
@@ -51,7 +50,8 @@ from __future__ import annotations
 
 from typing import Optional
 
-WAITING_THRESHOLD = 0.1   # m/s -> vehicle is considered "stopped" below this
+# Any vehicle moving slower than this (m/s) is considered "stopped"
+WAITING_THRESHOLD = 0.1
 
 try:
     import traci
@@ -68,17 +68,12 @@ class RewardCalculator:
     """
     Computes a scalar reward for one simulation step.
 
-    Parameters
-    ----------
-    reward_type : str
-        One of ``"arrived"``, ``"waiting"``, ``"congestion"``, ``"combined"``.
-        Default is ``"combined"``.
-    arrived_weight : float
-        Weight on the arrived-vehicles term  (combined mode only).
-    waiting_weight : float
-        Weight on the mean-waiting-time penalty  (combined mode only).
-    collision_coef : float
-        Penalty multiplied by the number of collisions  (combined mode only).
+    Args:
+        reward_type (str): The strategy to use ("arrived", "waiting", "congestion", "combined").
+                           Defaults to "combined".
+        arrived_weight (float): Multiplier for vehicles that finished their route (combined mode only).
+        waiting_weight (float): Penalty multiplier for the mean waiting time (combined mode only).
+        collision_coef (float): Huge penalty multiplier for crashes (combined mode only).
     """
 
     def __init__(
@@ -98,18 +93,15 @@ class RewardCalculator:
         self.waiting_weight = waiting_weight
         self.collision_coef = collision_coef
 
-
     def compute(self) -> float:
         """
-        Compute and return the reward for the current simulation step.
+        Computes and returns the reward for the current simulation step.
 
-        Must be called **after** ``traci.simulationStep()`` so that the
-        arrived / collision counters have been updated for this step.
+        CRITICAL: This must be called AFTER traci.simulationStep() so that SUMO 
+        has already updated the internal counters for arrivals and collisions.
 
-        Returns
-        -------
-        float
-            Scalar reward value.
+        Returns:
+            float: The computed scalar reward value.
         """
         if self.reward_type == "arrived":
             return self._reward_arrived()
@@ -117,26 +109,26 @@ class RewardCalculator:
             return self._reward_waiting()
         elif self.reward_type == "congestion":
             return self._reward_congestion()
-        else:  # "combined"
+        else:
             return self._reward_combined()
-
 
     def _reward_arrived(self) -> float:
         """
-        +1 per vehicle that finished its route this step.
-        Mirrors the teacher's reference: reward += traci.simulation.getArrivedNumber()
+        Grants +1 for every vehicle that left the network this step.
+        Mirrors the teacher's original logic exactly.
         """
         return float(traci.simulation.getArrivedNumber())
 
     def _reward_waiting(self) -> float:
         """
-        Negative mean accumulated waiting time.
-        Encourages the agent to reduce queues.
-        Returns 0.0 if no vehicles are present.
+        Calculates the negative mean accumulated waiting time.
+        Used to punish the agent for making cars wait too long at red lights.
+        Returns 0.0 if the network is currently empty.
         """
         vehicle_ids = list(traci.vehicle.getIDList())
         if not vehicle_ids:
             return 0.0
+            
         total_wait = sum(
             traci.vehicle.getAccumulatedWaitingTime(vid)
             for vid in vehicle_ids
@@ -145,12 +137,13 @@ class RewardCalculator:
 
     def _reward_congestion(self) -> float:
         """
-        Negative congestion index: −(stopped_vehicles / total_vehicles).
-        Returns 0.0 when the network is empty.
+        Calculates a negative congestion index: -(stopped_vehicles / total_vehicles).
+        Returns 0.0 if the network is empty.
         """
         vehicle_ids = list(traci.vehicle.getIDList())
         if not vehicle_ids:
             return 0.0
+            
         n_stopped = sum(
             1 for vid in vehicle_ids
             if traci.vehicle.getSpeed(vid) < WAITING_THRESHOLD
@@ -159,16 +152,13 @@ class RewardCalculator:
 
     def _reward_combined(self) -> float:
         """
-        Throughput reward - waiting penalty - collision penalty.
-
-        combined = arrived_weight  * n_arrived
-                 - waiting_weight  * mean_waiting_time
-                 - collision_coef  * n_collisions
+        Our custom blended reward function.
+        Balances throughput (good), waiting times (bad), and collisions (very bad).
         """
         n_arrived    = traci.simulation.getArrivedNumber()
         n_collisions = traci.simulation.getCollidingVehiclesNumber()
 
-        vehicle_ids  = list(traci.vehicle.getIDList())
+        vehicle_ids = list(traci.vehicle.getIDList())
         if vehicle_ids:
             mean_wait = sum(
                 traci.vehicle.getAccumulatedWaitingTime(vid)
@@ -178,14 +168,13 @@ class RewardCalculator:
             mean_wait = 0.0
 
         return (
-              self.arrived_weight * n_arrived
-            - self.waiting_weight * mean_wait
-            - self.collision_coef * n_collisions
+              (self.arrived_weight * n_arrived)
+            - (self.waiting_weight * mean_wait)
+            - (self.collision_coef * n_collisions)
         )
-    
-    # ------- Convenience --------
 
     def __repr__(self) -> str:
+        """Quick debug representation of the current calculator config."""
         return (
             f"RewardCalculator(type={self.reward_type!r}, "
             f"arrived_w={self.arrived_weight}, "

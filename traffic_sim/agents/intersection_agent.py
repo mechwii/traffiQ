@@ -1,70 +1,52 @@
 # traffic_sim/agents/intersection_agent.py
 """
 IntersectionAgent
-=================
+
 Wraps the pre-trained CNN (DQN) model and adapts its output to the
 {lane_id: 0 | 1} action format used by SumoEnvironment.
 
-One agent is created per intersection (complex intersections are excluded).
+One agent is created per intersection (complex intersections are excluded because
+the model was only trained on four-direction layouts).
 
-How the model works
--------------------
-  Input  : (image_size, image_size, 3)  uint8 RGB image
-  Output : 256 Q-values   (one per discrete action 0..255)
-  Action : argmax over Q-values  ->  integer 0..255
-           converted to 8-bit binary -> 8 bits, each bit = go/stop for one slot
+How the model works:
+    Input  : (image_size, image_size, 3) uint8 RGB image of the intersection.
+    Output : 256 Q-values, one per discrete action (0 to 255).
+    Action : argmax over Q-values gives an integer 0-255.
+             That integer is decoded to 8 bits, one bit per control slot.
 
-Bit layout (teacher's training order, mapped to our directions)
----------------------------------------------------------------
-  bits[0] -> N leader    bits[1] -> N follower (ignored)
-  bits[2] -> E leader    bits[3] -> E follower (ignored)
-  bits[4] -> W leader    bits[5] -> W follower (ignored)
-  bits[6] -> S leader    bits[7] -> S follower (ignored)
+Bit layout (teacher's training order):
+    bits[0] -> North leader    bits[1] -> North follower (ignored by us)
+    bits[2] -> East leader     bits[3] -> East follower (ignored)
+    bits[4] -> West leader     bits[5] -> West follower (ignored)
+    bits[6] -> South leader    bits[7] -> South follower (ignored)
 
-  If the network has fewer than 4 incoming directions (e.g. T-junction
-  with 3 arms), the extra bits are silently ignored.
+    We only use bits 0, 2, 4, 6 (the leader bits). The follower bits were
+    used internally by the teacher's training environment but are not relevant
+    here since we control followers separately via stop_non_leaders().
 
-Safety filter (route-aware)
----------------------------
-  After the model produces go/stop bits per direction, _safety_filter()
-  removes conflicting simultaneous "go" decisions.
+Safety filter (route-aware):
+    After decoding the bits, _safety_filter() checks for conflicting simultaneous
+    "go" decisions. It queries each vehicle's route via TraCI to determine the
+    actual turn type (straight, left, right) and uses a conflict table to decide
+    whether two directions can safely cross at the same time. This is less
+    restrictive than blocking all perpendicular pairs and closer to the teacher's
+    security_matrice.npy behavior.
 
-  The filter is ROUTE-AWARE: it queries each vehicle's route via TraCI
-  to determine whether two vehicles' paths actually cross inside the
-  junction.  This is less restrictive than the old direction-only check
-  (which blocked ALL perpendicular pairs) and closer to the teacher's
-  security_matrice.npy behaviour.
+    Priority order for conflict resolution: N > E > S > W.
 
-  Conflict rules (standard right-hand traffic):
-    - Parallel directions (N+S or E+W) NEVER conflict when both go
-      straight or both turn right.
-    - Right turns generally don't conflict with perpendicular traffic
-      (they merge rather than cross).
-    - Left turns conflict with oncoming straight and perpendicular
-      through-traffic.
-    - When route information is unavailable, the filter falls back to
-      the conservative direction-only check.
+Deadlock guard:
+    If the model outputs all-zero (everyone stop), the deadlock guard immediately
+    releases the lane whose leader has been waiting the longest. This prevents the
+    simulation from freezing when the model gets stuck in a bad local decision.
 
-  Priority order: N > E > S > W  (matches teacher's convention).
+Model sharing:
+    For multi-intersection setups, all agents share the same Keras model instance
+    loaded once from disk. Use the create_agents() class method to build them all
+    at once and avoid loading the same weights multiple times.
 
-Model sharing
--------------
-  For multi-intersection networks (2, 4, 8 junctions), each junction
-  gets its own IntersectionAgent, but they all share the SAME Keras
-  model instance.  Use the class method ``create_agents()`` to build
-  all agents with a single model load.
-
-Usage
------
-    from traffic_sim.agents.intersection_agent import IntersectionAgent
-
-    # Single intersection
+Usage:
     agent = IntersectionAgent(model_path="./save_model", image_size=50)
-
-    # Multiple intersections — one model, shared
-    agents = IntersectionAgent.create_agents(
-        count=4, model_path="./save_model", image_size=50
-    )
+    agents = IntersectionAgent.create_agents(count=4, model_path="./save_model")
 """
 
 from __future__ import annotations
@@ -86,10 +68,11 @@ try:
 except ImportError:
     TRACI_AVAILABLE = False
 
-# Cardinal directions the model knows about
+# The four cardinal directions the model knows about.
 _DIRECTIONS = ["N", "S", "E", "W"]
 
-# Bit index in the 8-bit decoded action for each direction's leader decision
+# Which bit index in the 8-bit decoded action corresponds to each direction's leader.
+# Bits 0, 2, 4, 6 are the leader slots. Odd bits are follower slots (unused here).
 _DIRECTION_BIT_INDEX: Dict[str, int] = {
     "N": 0,
     "E": 2,
@@ -97,62 +80,69 @@ _DIRECTION_BIT_INDEX: Dict[str, int] = {
     "S": 6,
 }
 
-# Direction pairs that can ALWAYS safely cross (parallel traffic, same axis)
+# Parallel direction pairs that can ALWAYS safely cross at the same time.
+# North + South and East + West never have crossing paths when going straight.
 _ALWAYS_SAFE_PAIRS = {
     frozenset({"N", "S"}),
     frozenset({"E", "W"}),
 }
 
-# Priority order for resolving conflicts (higher priority kept first)
+# Priority order used when resolving conflicting "go" decisions.
+# North is checked first, West last.
 _PRIORITY_ORDER = ["N", "E", "S", "W"]
 
-# Opposite directions
+# Mapping from a direction to its opposite.
 _OPPOSITE: Dict[str, str] = {"N": "S", "S": "N", "E": "W", "W": "E"}
 
-# Turn types: (entry_direction, exit_direction) -> "straight" | "left" | "right"
-# For right-hand traffic (driving on the right side of the road):
-#   Entering from N, exiting to S = straight
-#   Entering from N, exiting to W = right turn
-#   Entering from N, exiting to E = left turn
+# Turn classification table: (entry_direction, exit_direction) -> turn type.
+# Based on standard right-hand traffic rules (driving on the right side of the road).
+# Example: entering from N and exiting to S = straight through.
+#          entering from N and exiting to W = right turn.
+#          entering from N and exiting to E = left turn.
 _TURN_TYPE: Dict[Tuple[str, str], str] = {
-    ("N", "S"): "straight", ("N", "W"): "right", ("N", "E"): "left",
-    ("S", "N"): "straight", ("S", "E"): "right", ("S", "W"): "left",
-    ("E", "W"): "straight", ("E", "S"): "right", ("E", "N"): "left",
-    ("W", "E"): "straight", ("W", "N"): "right", ("W", "S"): "left",
+    ("N", "S"): "straight", ("N", "W"): "right",    ("N", "E"): "left",
+    ("S", "N"): "straight", ("S", "E"): "right",    ("S", "W"): "left",
+    ("E", "W"): "straight", ("E", "S"): "right",    ("E", "N"): "left",
+    ("W", "E"): "straight", ("W", "N"): "right",    ("W", "S"): "left",
 }
 
-# Route-aware conflict table.
-# Key: (turn_type_A, turn_type_B)  Value: True if they conflict.
-# Two RIGHT turns never conflict (they merge into different lanes).
-# A RIGHT + STRAIGHT is safe if they're not from the same axis.
-# LEFT turns conflict with almost everything from perpendicular dirs.
+# Route-aware conflict table for perpendicular direction pairs.
+# Key: (turn_type_of_A, turn_type_of_B). Value: True if they conflict.
+# Two right turns never conflict because both vehicles merge without crossing.
+# Left turns conflict with almost everything from perpendicular directions.
 _PERPENDICULAR_CONFLICT: Dict[Tuple[str, str], bool] = {
-    ("right",    "right"):    False,  # both merging, no crossing
-    ("right",    "straight"): False,  # right turn merges, doesn't cross
-    ("right",    "left"):     True,   # left turn crosses right's exit path
-    ("straight", "right"):    False,  # symmetric
-    ("straight", "straight"): True,   # perpendicular straights cross
-    ("straight", "left"):     True,   # left turn crosses straight
-    ("left",     "right"):    True,   # symmetric
-    ("left",     "straight"): True,   # symmetric
-    ("left",     "left"):     True,   # both crossing, conflict
+    ("right",    "right"):    False,
+    ("right",    "straight"): False,
+    ("right",    "left"):     True,
+    ("straight", "right"):    False,
+    ("straight", "straight"): True,
+    ("straight", "left"):     True,
+    ("left",     "right"):    True,
+    ("left",     "straight"): True,
+    ("left",     "left"):     True,
 }
 
-# Regex to strip the trailing lane index from a lane ID
+# Regex to strip the trailing lane index (e.g. "_0", "_1") from a lane ID.
 _LANE_INDEX_RE = re.compile(r"_\d+$")
 
 
 def _strip_lane_index(lane_or_edge: str) -> str:
-    """Strip the trailing lane index from a lane ID to recover the edge ID."""
+    """Remove the trailing lane index from a lane ID to get the parent edge ID.
+    Example: "C_to_N_0" -> "C_to_N"
+    """
     return _LANE_INDEX_RE.sub("", lane_or_edge)
 
 
 def _lane_to_direction(lane_id: str) -> Optional[str]:
     """
-    Infer the cardinal direction (N/S/E/W) of an INCOMING lane.
+    Infer the cardinal direction (N/S/E/W) of an incoming lane from its ID.
 
-    Returns None for outgoing lanes, internal lanes, or unrecognised formats.
-    Handles single-intersection, linear-chain, and grid topologies.
+    Returns None for outgoing lanes, internal junction lanes, or formats we
+    don't recognise. Handles single-intersection, linear-chain, and grid topologies.
+
+    Single intersection example:  "N_to_C_0" -> origin is "N" -> returns "N"
+    Multi-intersection example:   "N0_to_J0_0" -> origin is "N0" -> returns "N"
+    Grid internal road example:   "J_0_0_to_J_0_1_0" -> infers direction from coords
     """
     if "_to_" not in lane_id:
         return None
@@ -160,30 +150,32 @@ def _lane_to_direction(lane_id: str) -> Optional[str]:
     origin, dest_raw = lane_id.split("_to_", 1)
     dest_edge = _strip_lane_index(dest_raw)
 
-    # 1. Border node origin (single intersection: "N_to_C", multi: "N0_to_J0")
+    # Case 1: origin is a border node directly (e.g. "N", "S", "N0", "W_0_0").
     for d in _DIRECTIONS:
         if origin == d:
             return d
         if len(origin) > 1 and origin[0] == d and (origin[1].isdigit() or origin[1] == "_"):
             return d
 
-    # 2. Internal road between two junctions
+    # Case 2: internal road between two junction nodes (e.g. J0 -> J1 in a chain).
+    # We infer the direction from the relative positions encoded in the junction IDs.
     if not (origin.startswith("J") and dest_edge.startswith("J")):
         return None
 
     def _extract_nums(jid: str) -> List[int]:
+        # Strip the "J" prefix and any leading underscores, then parse all numbers.
         inner = jid[1:].lstrip("_")
         return [int(s) for s in inner.replace("_", " ").split() if s.isdigit()]
 
     o_nums = _extract_nums(origin)
     d_nums = _extract_nums(dest_edge)
 
-    # Linear chain: J0 -> J1  (single index)
+    # Linear chain (single index): J0 -> J1 means travelling east (from J0's perspective).
     if len(o_nums) == 1 and len(d_nums) == 1:
         if o_nums[0] < d_nums[0]: return "W"
         if o_nums[0] > d_nums[0]: return "E"
 
-    # Grid: J_0_0 -> J_0_1  (row, col indices)
+    # Grid (row, col indices): direction depends on whether row or col changes.
     elif len(o_nums) == 2 and len(d_nums) == 2:
         o_row, o_col = o_nums
         d_row, d_col = d_nums
@@ -192,18 +184,15 @@ def _lane_to_direction(lane_id: str) -> Optional[str]:
         if o_row < d_row: return "S"
         if o_row > d_row: return "N"
 
-    # Fallback: could not determine direction
     return None
 
 
 def _get_vehicle_exit_direction(vid: str) -> Optional[str]:
     """
-    Determine the exit direction of a vehicle from its route.
+    Determine which direction a vehicle will exit the intersection from its route.
 
-    Looks at the LAST edge in the vehicle's route and infers the
-    border-node direction from its name.
-
-    Returns one of "N", "S", "E", "W" or None if undetermined.
+    Reads the last edge in the vehicle's route and extracts the border node direction
+    from the edge name. Returns None if route info is unavailable.
     """
     if not TRACI_AVAILABLE:
         return None
@@ -212,7 +201,7 @@ def _get_vehicle_exit_direction(vid: str) -> Optional[str]:
         if not route:
             return None
         last_edge = route[-1]
-        # Last edge goes toward a border node: "C_to_N", "J0_to_S0", etc.
+        # The last edge always leads to a border node, e.g. "C_to_N" or "J0_to_S0".
         if "_to_" in last_edge:
             dest_node = last_edge.split("_to_")[-1]
             if dest_node and dest_node[0] in ("N", "S", "E", "W"):
@@ -224,8 +213,11 @@ def _get_vehicle_exit_direction(vid: str) -> Optional[str]:
 
 def _int_to_bits(action_int: int, n_bits: int = 8) -> List[int]:
     """
-    Convert integer 0..255 to a list of n_bits bits, MSB first.
-    Mirrors the teacher's trad_action().
+    Convert an integer (0-255) to a list of n_bits bits, MSB first.
+
+    This mirrors the teacher's trad_action() function exactly.
+    The MSB-first order means bit index 0 corresponds to the highest-value bit.
+    Example: 6 = binary 00000110 -> [0, 0, 0, 0, 0, 1, 1, 0]
     """
     bits = []
     for _ in range(n_bits):
@@ -238,23 +230,20 @@ class IntersectionAgent:
     """
     One DQN agent controlling a single (non-complex) intersection.
 
-    Parameters
-    ----------
-    model_path      : str        path to SavedModel directory
-    image_size      : int        input image side length in pixels
-    intersection_id : int        index of this intersection (logging only)
-    shared_model    : keras.Model | None
-        If provided, this model is used directly instead of loading from
-        disk.  Use create_agents() to build multiple agents that share
-        one model.
+    Args:
+        model_path: Path to the SavedModel directory on disk.
+        image_size: Input image side length in pixels (must match training config).
+        intersection_id: Index of this agent, used only for logging.
+        shared_model: If provided, use this existing Keras model instead of loading
+                      from disk. Used by create_agents() to share weights across agents.
     """
 
     def __init__(
         self,
-        model_path: str = "./save_model",
-        image_size: int = 50,
-        intersection_id: int = 0,
-        shared_model=None,
+        model_path:      str          = "./save_model",
+        image_size:      int          = 50,
+        intersection_id: int          = 0,
+        shared_model                  = None,
     ):
         if not TF_AVAILABLE:
             raise EnvironmentError(
@@ -275,22 +264,22 @@ class IntersectionAgent:
             self.model.summary()
             print(f"[IntersectionAgent #{intersection_id}] Model loaded.")
 
-    # ------------------------------------------------------------------ #
+    # ===================================================================== #
     #  Factory method for multi-agent setups (shared model)                #
-    # ------------------------------------------------------------------ #
+    # ===================================================================== #
 
     @classmethod
     def create_agents(
         cls,
-        count: int,
+        count:      int,
         model_path: str = "./save_model",
         image_size: int = 50,
     ) -> List["IntersectionAgent"]:
         """
-        Create *count* agents that share a single model instance.
+        Create 'count' agents that all share the same Keras model instance.
 
-        This avoids loading the same weights from disk N times and
-        uses less memory.
+        Loading the model once and sharing it avoids reading the same weights
+        from disk N times, which saves both time and memory on large networks.
         """
         print(f"[IntersectionAgent] Loading shared model from '{model_path}' ...")
         shared = keras.models.load_model(model_path)
@@ -299,45 +288,44 @@ class IntersectionAgent:
 
         return [
             cls(
-                model_path=model_path,
-                image_size=image_size,
-                intersection_id=i,
-                shared_model=shared,
+                model_path      = model_path,
+                image_size      = image_size,
+                intersection_id = i,
+                shared_model    = shared,
             )
             for i in range(count)
         ]
 
-    # ------------------------------------------------------------------ #
+    # ===================================================================== #
     #  Public API                                                          #
-    # ------------------------------------------------------------------ #
+    # ===================================================================== #
 
     def act(self, obs: Dict[str, Any]) -> Dict[str, int]:
         """
         Choose a go/stop action for every incoming lane at this intersection.
 
-        Returns {lane_id: 0 | 1}  (1=go, 0=stop).
+        Returns {lane_id: 0 | 1} where 1=go and 0=stop.
 
         Processing pipeline:
-          1. CNN forward pass -> integer action 0..255
-          2. Decode to 8-bit binary -> per-direction go/stop
-          3. Map direction bits to lane IDs
-          4. Safety filter: remove conflicting "go" pairs (route-aware)
-          5. Deadlock guard: if all lanes stopped for too long, release
-             the longest-waiting leader
+            1. Run the CNN forward pass to get a greedy integer action (0-255).
+            2. Decode that integer to 8 bits (one bit per direction slot).
+            3. Map the leader bits to the actual lane IDs in this observation.
+            4. Run the safety filter to remove conflicting go decisions.
+            5. Run the deadlock guard if all lanes came out as stop.
         """
         image   = obs["image"]
         leaders = obs["leaders"]
 
-        # 1. CNN inference
+        # Step 1: CNN inference -> integer action
         action_int = self._predict(image)
         bits       = _int_to_bits(action_int, n_bits=8)
 
-        # 2. Direction bits (only leader bits, indices 0,2,4,6)
+        # Step 2: extract only the leader bits (indices 0, 2, 4, 6)
         direction_bits: Dict[str, int] = {
             d: bits[idx] for d, idx in _DIRECTION_BIT_INDEX.items()
         }
 
-        # 3. Map to lane IDs
+        # Step 3: map direction decisions to the actual lane IDs present in this obs
         action: Dict[str, int] = {}
         for lane_id, vehicle_id in leaders.items():
             if vehicle_id is None:
@@ -347,41 +335,37 @@ class IntersectionAgent:
                 continue
             action[lane_id] = direction_bits[direction]
 
-        # 4. Safety filter: prevent conflicting "go" pairs (route-aware)
+        # Step 4: safety filter removes conflicting simultaneous go decisions
         action = self._safety_filter(action, leaders)
 
-        # 5. Deadlock guard: if ALL are stopped and someone is waiting
-        #    too long, release the longest-waiting leader
+        # Step 5: deadlock guard releases the longest-waiting vehicle if all are stopped
         if action and all(v == 0 for v in action.values()):
             action = self._deadlock_guard(action, leaders)
 
         return action
 
-    # ------------------------------------------------------------------ #
+    # ===================================================================== #
     #  Route-aware safety filter                                           #
-    # ------------------------------------------------------------------ #
+    # ===================================================================== #
 
     def _safety_filter(
         self,
-        action: Dict[str, int],
+        action:  Dict[str, int],
         leaders: Dict[str, Optional[str]],
     ) -> Dict[str, int]:
         """
-        Remove conflicting go-actions using route-aware conflict detection.
+        Remove conflicting go-decisions using route-aware conflict detection.
 
-        For each pair of "go" directions, the filter:
-          1. Checks if they are parallel (N+S or E+W) -> always safe.
-          2. For perpendicular pairs, queries each vehicle's route via
-             TraCI to determine turn type (straight, left, right).
-          3. Uses the conflict table to decide if the pair is safe.
-          4. Falls back to conservative blocking if route info is
-             unavailable.
+        For each pair of "go" directions:
+            1. If they are parallel (N+S or E+W) they are always safe.
+            2. For perpendicular pairs, we query each vehicle's route to determine
+               its turn type (straight, left, right).
+            3. We look up the (turn_A, turn_B) pair in the conflict table.
+            4. If the pair conflicts, the lower-priority direction is stopped.
 
-        This is less restrictive than the old direction-only check
-        (which blocked ALL perpendicular pairs) and closer to the
-        teacher's security_matrice.npy behaviour.
+        Directions are processed in priority order (N, E, S, W) so the highest
+        priority direction is always accepted first.
         """
-        # Group "go" lanes by direction, with their vehicle IDs
         go_by_dir: Dict[str, List[Tuple[str, Optional[str]]]] = {}
         for lane_id, go_val in action.items():
             if go_val == 1:
@@ -391,10 +375,9 @@ class IntersectionAgent:
                     go_by_dir.setdefault(d, []).append((lane_id, vid))
 
         if len(go_by_dir) <= 1:
-            return action   # 0 or 1 direction active -> no conflict
+            return action  # zero or one active direction, nothing to check
 
-        # Greedily accept directions in priority order
-        accepted: Dict[str, str] = {}  # direction -> turn_type
+        accepted: Dict[str, str] = {}  # direction -> its turn type
 
         for d in _PRIORITY_ORDER:
             if d not in go_by_dir:
@@ -413,7 +396,7 @@ class IntersectionAgent:
             if is_safe:
                 accepted[d] = turn_type
 
-        # Set rejected directions to STOP
+        # Any direction not accepted is forced to stop.
         for d, lane_entries in go_by_dir.items():
             if d not in accepted:
                 for lid, _ in lane_entries:
@@ -423,15 +406,16 @@ class IntersectionAgent:
 
     def _get_turn_type(
         self,
-        entry_dir: str,
+        entry_dir:    str,
         lane_entries: List[Tuple[str, Optional[str]]],
     ) -> str:
         """
-        Determine the turn type for a direction's leader vehicle.
+        Determine the turn type for the leader vehicle in a given direction.
 
-        Queries TraCI for the vehicle's route to find the exit direction.
-        Falls back to "straight" (most conservative for conflict checking)
-        if route info is unavailable.
+        Queries TraCI for the vehicle's route to find its exit direction, then
+        looks up the (entry, exit) pair in the _TURN_TYPE table. Falls back to
+        "straight" if route information is unavailable, since straight is the
+        most likely to conflict and therefore the safest assumption.
         """
         for _, vid in lane_entries:
             if vid is None:
@@ -441,7 +425,6 @@ class IntersectionAgent:
                 turn = _TURN_TYPE.get((entry_dir, exit_dir))
                 if turn is not None:
                     return turn
-        # Fallback: assume straight (most likely to conflict)
         return "straight"
 
     @staticmethod
@@ -450,51 +433,45 @@ class IntersectionAgent:
         dir_b: str, turn_b: str,
     ) -> bool:
         """
-        Return True if two directions can safely cross simultaneously.
+        Return True if two directions can safely cross the junction simultaneously.
 
-        Parallel directions (N+S, E+W) are always safe.
-        For perpendicular directions, uses the route-aware conflict table.
+        Parallel pairs (N+S, E+W) are always safe. For perpendicular pairs we check
+        the turn-type conflict table. Returns False for any unknown combination
+        to err on the side of safety.
         """
         pair = frozenset({dir_a, dir_b})
 
-        # Parallel directions: always safe
         if pair in _ALWAYS_SAFE_PAIRS:
             return True
 
-        # Perpendicular directions: check turn-type conflict table
         conflicts = _PERPENDICULAR_CONFLICT.get((turn_a, turn_b))
         if conflicts is not None:
             return not conflicts
 
-        # Unknown turn combo — block to be safe
-        return False
-
-    # ------------------------------------------------------------------ #
+        return False  # unknown combination, block to be safe
+    
+    # ===================================================================== #
     #  Deadlock guard                                                      #
-    # ------------------------------------------------------------------ #
-
+    # ===================================================================== #
     def _deadlock_guard(
         self,
-        action: Dict[str, int],
+        action:  Dict[str, int],
         leaders: Dict[str, Optional[str]],
     ) -> Dict[str, int]:
         """
-        If ALL lanes are stopped (all-zero action), immediately release
-        the leader that has been waiting the longest.
+        Release the longest-waiting vehicle when the AI outputs all-stop.
 
-        Why no threshold: when vehicles are stopped via setStop(), SUMO
-        treats it as a "planned stop" and getAccumulatedWaitingTime()
-        may not increase.  So we use getSpeed() < 0.1 to confirm the
-        vehicle is actually stopped, and release unconditionally.
+        When every lane gets a stop decision the intersection is frozen and the
+        state will never change on its own, so we intervene. We find the leader
+        that has been waiting the longest and force its lane to go.
 
-        This fires every time the AI outputs all-zero, which is fine:
-        the AgentCallManager will re-trigger more frequently during
-        deadlocks (every 3 steps) so the released vehicle has time
-        to cross before the next decision.
+        Note: vehicles stopped via setStop() are sometimes reported with
+        getAccumulatedWaitingTime() = 0, so we fall back to a minimum wait of 1.0
+        to still pick a lane even in that case.
         """
-        best_lane      = None
-        best_wait      = -1.0
-        any_stopped    = False
+        best_lane   = None
+        best_wait   = -1.0
+        any_stopped = False
 
         for lid in action:
             vid = leaders.get(lid)
@@ -506,7 +483,7 @@ class IntersectionAgent:
                     any_stopped = True
                 wait = traci.vehicle.getAccumulatedWaitingTime(vid)
                 if wait < 0.1:
-                    wait = 1.0   # setStop vehicles may report 0
+                    wait = 1.0  # setStop vehicles may report 0, use 1.0 as a floor
             except Exception:
                 wait = 1.0
 
@@ -517,22 +494,27 @@ class IntersectionAgent:
         if any_stopped and best_lane is not None:
             print(
                 f"[DEADLOCK GUARD #{self.intersection_id}] "
-                f"All stopped — releasing {best_lane}."
+                f"All stopped -> releasing {best_lane}."
             )
             action[best_lane] = 1
 
         return action
 
-    # ------------------------------------------------------------------ #
+    # ===================================================================== #
     #  Internal                                                            #
-    # ------------------------------------------------------------------ #
+    # ===================================================================== #
 
     def _predict(self, image: np.ndarray) -> int:
-        """Run CNN forward pass, return greedy action integer 0-255."""
+        """
+        Run the CNN forward pass and return the greedy action integer (0-255).
+
+        We convert the image to float32 before passing it to TensorFlow since
+        the model expects float inputs even though the image is stored as uint8.
+        """
         if image.dtype != np.uint8:
             image = image.astype(np.uint8)
         state_tensor = tf.convert_to_tensor(image, dtype=tf.float32)
-        state_tensor = tf.expand_dims(state_tensor, 0)
+        state_tensor = tf.expand_dims(state_tensor, 0)  # add batch dimension
         action_probs = self.model(state_tensor, training=False)
         return int(tf.argmax(action_probs[0]).numpy())
 

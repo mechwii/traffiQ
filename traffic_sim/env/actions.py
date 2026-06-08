@@ -2,89 +2,100 @@
 """
 ActionHandler
 
-This class applies traffic control actions to vehicles in the SUMO simulation via the TraCi API.
+Single point of truth for all vehicle control in the simulation.
+Every TraCI command that touches a vehicle goes through this class.
+SumoEnvironment never calls TraCI vehicle functions directly, which keeps
+the environment logic clean and makes control strategies easy to swap out.
 
-It implements the three action functions from the specification : 
-    - set_action(actions) => apply speed / movement commands to vehicles
-    - set_speedMode(mode) => configure how SUMO enforces speed limits
-    - set_loaded_veh(leaders) => stop all non-leader vehicles (hold them back)
+The class implements the three action primitives from the project spec:
+    set_action()        -> apply speed commands to arbitrary vehicles
+    set_speedMode()     -> configure SUMO's internal safety checks per vehicle
+    set_loaded_veh()    -> enforce the leader/follower hierarchy
 
-It also provides the binary go/stop action logic used by the DQN agent:
-    - apply_binary_action(action, leaders) => setStop-based go/stop for leaders
-    - stop_non_leaders(incoming_leaders)    => hold followers behind intersection
-    - set_speed_modes_loaded(mode)         => speed mode for newly loaded vehicles
-    - stop_departed_non_leaders(leaders)    => catch vehicles entering mid-step
+On top of those, it provides the DQN-specific pipeline called each step:
+    set_speed_modes_loaded()     -> set mode 55 for vehicles that just entered
+    stop_non_leaders()           -> hold followers behind the intersection
+    apply_binary_action()        -> go / stop leaders based on the AI decision
+    stop_departed_non_leaders()  -> catch vehicles that spawned mid-step
 
-TraCi calls used (with explanations) :
-
+TraCI calls used:
     traci.vehicle.setSpeed(vid, speed)
-      Force a vehicle to a specific speed (m/s).
-      Use -1 to hand control back to SUMO's default car-following model.
+        Force a vehicle to a specific speed (m/s). Pass -1 to hand control
+        back to SUMO's car-following model.
 
-    traci.vehicle.setSpeedMode(vid, mode):
-        Integer bitmask that controls which SUMO speed checks are active.
-        See set_speedMode() docstring for bit definitions.
+    traci.vehicle.setSpeedMode(vid, mode)
+        Integer bitmask controlling which SUMO speed safety checks are active.
+        See set_speedMode() for a full breakdown.
 
     traci.vehicle.setMaxSpeed(vid, speed)
-        Override the vehicle's maximum allowed speed.
-    
-    traci.vehicle.getLaneID(vid)
-        Get the lane a vehicle is currently on.
-    
-    traci.vehicle.getIDList()
-        All vehicles currently in the simulation.
+        Cap the vehicle's maximum allowed speed.
 
-    traci.vehicle.setStop(vid, edgeID, pos, ...)
-        Queue a stop for a vehicle on a given edge at a given position.
+    traci.vehicle.getLaneID(vid)
+        Return the lane the vehicle is currently on.
+
+    traci.vehicle.getIDList()
+        Return all vehicle IDs currently active in the network.
+
+    traci.vehicle.setStop(vid, edgeID, pos, duration=...)
+        Queue a planned stop at a given position on an edge.
+        Setting duration=0 on an existing stop releases the vehicle immediately.
 
     traci.vehicle.getNextStops(vid)
-        Return the list of upcoming stops for a vehicle.
+        Return the list of upcoming stops for this vehicle.
 
     traci.vehicle.setColor(vid, (R, G, B, A))
-        Change the visual colour of a vehicle in sumo-gui.
+        Change the vehicle's color in sumo-gui (visual debug only).
 """
 
-from typing import Any, Dict, List, Optional, Union  # for type management
+from typing import Any, Dict, List, Optional, Union
 
-# We safely import traci depending on if the environment has been rightly set up
+# traci may not be installed if the project is run outside a SUMO environment.
+# We use this flag so callers can check availability without crashing at import time.
 try:
     import traci
     TRACI_AVAILABLE = True
 except ImportError:
     TRACI_AVAILABLE = False
 
-# Default speed to assign when stopping a vehicle (m/s)
-# 0.0 = full stop -> use a very small positive value to keep the vehicle
-# "loaded" (in the network) but stationary.
+
+# Full stop target speed (m/s). SUMO keeps the vehicle "loaded" in the network
+# at 0.0 so it still physically occupies space and blocks followers naturally.
 STOP_SPEED = 0.0
 
-# Speed mode that gives full control to our code (disables all SUMO checks)
+# Speed mode 0 = binary 00000: every SUMO safety check disabled.
+# Useful for pure external control, but collisions can go undetected.
 SPEED_MODE_FULL_CONTROL = 0
 
-# Default speed mode that re-enables all SUMO safety checks
-SPEED_MODE_DEFAULT = 31   # binary 11111: all checks active
+# Speed mode 31 = binary 11111: all five SUMO safety checks active.
+# This is SUMO's standard default behavior.
+SPEED_MODE_DEFAULT = 31
 
-# Speed mode used by the AI agent: 55 = binary 110111
-# Disables junction right-of-way (bit 3) so the AI controls who crosses.
+# Speed mode 55 = binary 110111: all checks active except bit 3 (junction
+# right-of-way). This is the mode the teacher's reference uses — it lets the
+# AI decide who crosses the intersection instead of SUMO's built-in priority system.
 SPEED_MODE_AI_CONTROL = 55
 
 
 class ActionHandler:
     """
-    Applies control actions to vehicles in the running SUMO simulation.
+    Centralizes all TraCI vehicle commands for a running SUMO simulation.
 
-    This is the SINGLE place where vehicle actions are applied.
-    SumoEnvironment delegates ALL action logic here.
+    SumoEnvironment creates one instance of this class after TraCI connects
+    and delegates all vehicle interactions here. Nothing outside this class
+    should call traci.vehicle.set* directly.
 
-    Parameters :
-        step_length : float
-            Duration of one simulation step (seconds). Used when computing
-            acceleration limits for smooth speed changes.
+    Args:
+        step_length (float): Duration of one simulation step in seconds.
+                             Stored in case we need acceleration-based speed
+                             ramping later.
     """
 
     def __init__(self, step_length: float = 1.0):
         self.step_length = step_length
-        # Cached vehicle ID set — call refresh_cache() once per step
+
+        # Snapshot of active vehicle IDs, refreshed once per step via refresh_cache().
+        # We use a set so membership checks are O(1) instead of O(n),
+        # which matters when hundreds of vehicles are in the network simultaneously.
         self._vehicle_cache: Optional[set] = None
 
     # ================================================================== #
@@ -93,20 +104,21 @@ class ActionHandler:
 
     def refresh_cache(self) -> None:
         """
-        Refresh the cached set of active vehicle IDs.
+        Takes a snapshot of the currently active vehicle IDs from TraCI.
 
-        Must be called ONCE at the start of each step, before any other
-        method.  This avoids calling traci.vehicle.getIDList() on every
-        single _vehicle_exists() check (previously O(n) per check).
+        Call this exactly once at the start of each simulation step, before
+        any other method in this class. All subsequent _vehicle_exists() calls
+        within that step reuse this snapshot instead of hitting the TraCI API
+        repeatedly.
         """
         self._vehicle_cache = set(traci.vehicle.getIDList())
 
     def _vehicle_exists(self, vehicle_id: str) -> bool:
         """
-        Return True if the vehicle is currently in the simulation.
+        Check whether a vehicle is still active in the simulation.
 
-        Uses the cached vehicle set if available; falls back to a live
-        TraCI query if refresh_cache() has not been called this step.
+        Uses the cached snapshot when available. Falls back to a live TraCI
+        call if refresh_cache() was not called this step (e.g. during setup).
         """
         if self._vehicle_cache is not None:
             return vehicle_id in self._vehicle_cache
@@ -121,30 +133,31 @@ class ActionHandler:
         actions: Union[Dict[str, float], List[Dict[str, Any]], Any]
     ) -> None:
         """
-        Apply control actions to one or more vehicles.
+        Apply speed commands to one or more vehicles.
 
-        The method accepts three formats so it can work with different
-        control paradigms (manual scripts, RL agents, rule-based logic):
+        We support two formats here to keep things flexible whether we are
+        running scripted tests, RL agents, or rule-based controllers.
 
-        Format 1 - Speed dict (most common):
-            actions = {"veh_0": 8.0, "veh_1": 5.5, "veh_3": 0.0}
-            Each key is a vehicle ID; the value is the target speed in m/s.
-            Use -1.0 as the speed to return control to SUMO's default model.
+        Format 1: speed dictionary {vehicle_id: speed_m_s}
+            Each key is a vehicle ID, the value is the target speed in m/s.
+            Pass -1.0 to give control back to SUMO's car-following model.
+            Example: {"veh_0": 8.0, "veh_1": 0.0, "veh_2": -1.0}
 
-        Format 2 - List of actions dicts:
-            actions = [
-                {"vehicle_id": "veh_0", "type": "speed",     "value": 8.0},
-                {"vehicle_id": "veh_1", "type": "max_speed", "value": 10.0},
-                {"vehicle_id": "veh_2", "type": "reset"},
-            ]
-            Supported types :
-              - "speed" => set exact speed (m/s)
-              - "max_speed" => change maximum allowed speed
-              - "reset" => hand control back to SUMO car-following model
+        Format 2: list of command dictionaries
+            More expressive format that lets you mix action types.
+            Supported types:
+              "speed"     -> set exact speed (m/s)
+              "max_speed" -> change the vehicle's speed cap
+              "reset"     -> hand back control to SUMO
+            Example:
+                [
+                    {"vehicle_id": "veh_0", "type": "speed",     "value": 8.0},
+                    {"vehicle_id": "veh_1", "type": "max_speed", "value": 10.0},
+                    {"vehicle_id": "veh_2", "type": "reset"},
+                ]
 
-        Parameters :
-            actions : dict | list | None
-                Control commands (see formats above).
+        Args:
+            actions: Commands to apply. Silently ignored if None.
         """
         if actions is None:
             return
@@ -167,19 +180,17 @@ class ActionHandler:
 
                 if action_type == "speed":
                     self._apply_speed(vehicle_id, float(value))
-
                 elif action_type == "max_speed":
                     self._apply_max_speed(vehicle_id, float(value))
-
                 elif action_type == "reset":
                     self._reset_vehicle(vehicle_id)
-
                 else:
                     print(
-                       f"[ActionHandler] Unknown action type: '{action_type}' "
-                       f"for vehicle '{vehicle_id}' - skipped."
+                        f"[ActionHandler] Unknown action type: '{action_type}' "
+                        f"for vehicle '{vehicle_id}' - skipped."
                     )
             return
+
         print(
             f"[ActionHandler] Unrecognised action format: {type(actions)} - "
             "no actions applied."
@@ -191,29 +202,25 @@ class ActionHandler:
         mode: int = SPEED_MODE_DEFAULT,
     ) -> None:
         """
-        Set the speed mode for one or more vehicles.
+        Update the speed mode bitmask for one or more vehicles.
 
-        SUMO's speed mode is an integer bitmask.  Each bit enables or
-        disables a specific speed-safety check:
+        SUMO uses this bitmask to know which safety rules to enforce.
+        Each bit enables or disables a specific check:
+            Bit 0 (value  1): Safe speed according to the car-following model
+            Bit 1 (value  2): Maximum acceleration limit
+            Bit 2 (value  4): Maximum deceleration limit
+            Bit 3 (value  8): Junction right-of-way rules
+            Bit 4 (value 16): Braking at red lights and stop lines
 
-          Bit 0 (value  1): Regard safe speed (car-following model limit)
-          Bit 1 (value  2): Regard maximum acceleration
-          Bit 2 (value  4): Regard maximum deceleration
-          Bit 3 (value  8): Regard right-of-way at junctions
-          Bit 4 (value 16): Brake hard at red lights / stop lines
+        Common presets used in this project:
+            31  (11111) -> all checks active, default SUMO behavior
+             0  (00000) -> full external control, no checks at all
+            55 (110111) -> everything active except junction right-of-way (bit 3),
+                           which is what we use so the AI controls who crosses
 
-        Common presets:
-          31  (binary 11111) - default: all checks active
-           0  (binary 00000) - full external control: no SUMO checks
-          55  (binary 110111) - disable junction right-of-way (AI control)
-
-        Parameters :
-            vehicle_ids : list[str] | None
-                IDs of vehicles to update.  If None, all vehicles currently
-                in the simulation are updated.
-
-            mode : int
-                Speed mode bitmask (default 31 = all SUMO checks active).
+        Args:
+            vehicle_ids: Vehicles to update. If None, all active vehicles are updated.
+            mode: Bitmask to apply. Defaults to 31 (full SUMO safety).
         """
         targets = vehicle_ids or list(traci.vehicle.getIDList())
         for vehicle_id in targets:
@@ -225,24 +232,22 @@ class ActionHandler:
         leaders: Dict[str, Optional[str]],
     ) -> None:
         """
-        Stop all vehicles that are NOT the lane leader.
+        Enforce the leader/follower hierarchy for all active vehicles.
 
-        This function implements a "leader-follower" control strategy:
-          - Leader vehicles (the frontmost in their lane) are given back
-            control to SUMO's car-following model (speed = -1).
-          - All other vehicles are commanded to stop (speed = 0).
+        Leaders (frontmost vehicle per lane) are released to SUMO's normal
+        car-following model. Every other vehicle is commanded to stop at 0 m/s.
+        This prevents followers from pushing unsupervised into the junction
+        while the AI is still deciding who gets to go.
 
-        Parameters:
-            leaders -> dict {lane_id: vehicle_id | None}
-                Output of StateExtractor.get_leaders().  Maps lane IDs to
-                the ID of the lead vehicle on that lane (or None).
+        Args:
+            leaders: Map of {lane_id: vehicle_id | None} from StateExtractor.get_leaders().
         """
-        leaders_ids = {vid for vid in leaders.values() if vid is not None}
+        leader_ids = {vid for vid in leaders.values() if vid is not None}
 
-        all_vehicles = list(traci.vehicle.getIDList())
-
-        for vehicle_id in all_vehicles:
-            if vehicle_id in leaders_ids:
+        for vehicle_id in traci.vehicle.getIDList():
+            if vehicle_id in leader_ids:
+                # Give leaders back to SUMO -> apply_binary_action() will then
+                # queue a stop or release them depending on the AI decision.
                 self._reset_vehicle(vehicle_id)
             else:
                 self._apply_speed(vehicle_id, STOP_SPEED)
@@ -257,16 +262,21 @@ class ActionHandler:
         leaders: Dict[str, Optional[str]],
     ) -> None:
         """
-        Apply a discrete {lane_id: 0|1} action to leader vehicles.
+        Translate a {lane_id: 0|1} decision into TraCI stop or release commands.
 
-        Uses traci.vehicle.setStop() to match the teacher's reference:
-          - action=0 -> queue a stop 10 m before edge end
-          - action=1 -> release any existing stop, return to SUMO control
+        This mirrors the teacher's set_leaders_actions2():
+            action == 1 -> cancel any planned stop, let SUMO drive the car (green)
+            action == 0 -> queue a stop 10m before the junction (red)
 
-        Parameters
-        ----------
-        action  : {lane_id: 0|1}
-        leaders : {lane_id: vehicle_id|None}  (pre-queried, NOT re-fetched)
+        The stop position is computed as (lane_length - 10m) so vehicles queue
+        just short of the intersection box without overlapping it.
+        setStop() with duration=0 cancels a previously queued stop without
+        physically stopping the car.
+
+        Args:
+            action: Per-lane go/stop decision from the AI agent.
+            leaders: Pre-fetched leader snapshot. We do NOT re-query TraCI here
+                     to avoid inconsistencies if the simulation moved between calls.
         """
         for lane_id, go in action.items():
             vehicle_id = leaders.get(lane_id)
@@ -276,26 +286,30 @@ class ActionHandler:
             try:
                 road_id = traci.vehicle.getRoadID(vehicle_id)
                 if road_id.startswith(":"):
+                    # Vehicle is currently inside a junction (internal edge).
+                    # Calling setStop on an internal edge raises a TraCIException, so we skip it.
                     continue
 
-                lane   = traci.vehicle.getLaneID(vehicle_id)
-                length = traci.lane.getLength(lane)
+                lane     = traci.vehicle.getLaneID(vehicle_id)
+                length   = traci.lane.getLength(lane)
+                # Stop 10m before the edge ends so the car body doesn't overlap the junction box.
                 stop_pos = max(1.0, length - 10.0)
 
                 if go == 1:
-                    # Release: remove existing stop, hand back to SUMO
+                    # Green: cancel any planned stop and let SUMO take over.
                     traci.vehicle.setColor(vehicle_id, (0, 255, 0))
                     if traci.vehicle.getNextStops(vehicle_id):
-                        traci.vehicle.setStop(
-                            vehicle_id, road_id, stop_pos, duration=0
-                        )
+                        # duration=0 instantly clears the queued stop without halting the car.
+                        traci.vehicle.setStop(vehicle_id, road_id, stop_pos, duration=0)
                     traci.vehicle.setSpeed(vehicle_id, -1)
                 else:
-                    # Stop before intersection
+                    # Red: queue a stop before the junction if it's still reachable.
                     traci.vehicle.setColor(vehicle_id, (255, 0, 0))
                     self._safe_set_stop(vehicle_id, road_id, stop_pos)
 
             except traci.TraCIException:
+                # The vehicle may have left the network between the leaders query
+                # and this loop. Silently skip it.
                 pass
 
     def stop_non_leaders(
@@ -303,33 +317,42 @@ class ActionHandler:
         incoming_leaders: Dict[str, Optional[str]],
     ) -> None:
         """
-        Stop ALL active non-leader vehicles on incoming edges.
+        Force all follower vehicles to stop behind their lane's stop line.
 
-        Called once per step before actions are applied.  Non-leaders are
-        stopped 10 m before the edge end via setStop().  Vehicles on
-        internal edges (inside junction) or outgoing edges (past the
-        intersection) are left alone.
+        Called once per step BEFORE apply_binary_action() so only the
+        designated leader for each lane is free to move. Vehicles that are
+        inside the junction box or have already crossed it are skipped
+        because they are no longer under intersection control.
 
         Matches the teacher's set_loaded_vehicle().
+
+        Args:
+            incoming_leaders: Current leader per lane. Every vehicle not in
+                               this dict's values will be stopped.
         """
-        leader_vids = {vid for vid in incoming_leaders.values()
-                       if vid is not None}
+        leader_vids = {vid for vid in incoming_leaders.values() if vid is not None}
 
         for vid in traci.vehicle.getIDList():
             if vid in leader_vids:
                 continue
+
             try:
                 road_id = traci.vehicle.getRoadID(vid)
-                if road_id.startswith(":"):
-                    continue
-                if self._is_outgoing_edge(road_id):
-                    continue
 
-                lane   = traci.vehicle.getLaneID(vid)
-                length = traci.lane.getLength(lane)
+                if road_id.startswith(":"):
+                    continue  # inside the junction, leave it alone
+
+                if self._is_outgoing_edge(road_id):
+                    continue  # already crossed, don't interfere
+
+                lane     = traci.vehicle.getLaneID(vid)
+                length   = traci.lane.getLength(lane)
                 stop_pos = max(1.0, length - 10.0)
+
                 if self._safe_set_stop(vid, road_id, stop_pos):
+                    # Orange color so it's easy to spot waiting vehicles in the GUI.
                     traci.vehicle.setColor(vid, (255, 200, 0))
+
             except traci.TraCIException:
                 pass
 
@@ -338,26 +361,34 @@ class ActionHandler:
         incoming_leaders: Dict[str, Optional[str]],
     ) -> None:
         """
-        Stop vehicles that just departed this step and are not leaders.
+        Stop vehicles that spawned during the current simulation step.
 
-        Called AFTER simulationStep() to catch new arrivals that entered
-        the network during this step.
+        SUMO can insert vehicles mid-step, so they won't be in the
+        incoming_leaders snapshot taken before simulationStep(). This method
+        runs AFTER simulationStep() and stops any new arrivals that aren't
+        leaders, preventing them from free-rolling into the junction.
+
+        Args:
+            incoming_leaders: The same leader snapshot used before the step.
         """
-        leader_vids = {vid for vid in incoming_leaders.values()
-                       if vid is not None}
+        leader_vids = {vid for vid in incoming_leaders.values() if vid is not None}
 
         for vid in traci.simulation.getDepartedIDList():
             if vid in leader_vids:
                 continue
+
             try:
                 road_id = traci.vehicle.getRoadID(vid)
                 if road_id.startswith(":"):
                     continue
-                lane   = traci.vehicle.getLaneID(vid)
-                length = traci.lane.getLength(lane)
+
+                lane     = traci.vehicle.getLaneID(vid)
+                length   = traci.lane.getLength(lane)
                 stop_pos = max(1.0, length - 10.0)
+
                 if self._safe_set_stop(vid, road_id, stop_pos):
                     traci.vehicle.setColor(vid, (255, 200, 0))
+
             except traci.TraCIException:
                 pass
 
@@ -366,16 +397,22 @@ class ActionHandler:
         mode: int = SPEED_MODE_AI_CONTROL,
     ) -> None:
         """
-        Set speed mode for all newly loaded vehicles.
+        Apply the AI speed mode to all vehicles that were just loaded this step.
 
-        Mode 55 = binary 110111 = disable junction right-of-way (bit 3).
-        This gives the AI agent full control over who crosses.
-        Matches the teacher's set_speed_mode().
+        "Loaded" means the vehicle was scheduled into the network but may not
+        have actually departed yet. Setting the mode at load time (before departure)
+        ensures that no vehicle ever drives even a single step under SUMO's default
+        junction right-of-way rules.
+
+        Args:
+            mode: Speed mode bitmask. Defaults to 55 (AI control mode).
         """
         for vid in traci.simulation.getLoadedIDList():
             try:
                 traci.vehicle.setSpeedMode(vid, mode)
             except traci.TraCIException:
+                # Can happen if a vehicle was loaded but immediately discarded
+                # by SUMO because of a routing error.
                 pass
 
     # ================================================================== #
@@ -384,10 +421,10 @@ class ActionHandler:
 
     def _apply_speed(self, vehicle_id: str, speed: float) -> None:
         """
-        Command a vehicle (with vehicle_id) to travel at speed m/s.
+        Set a vehicle's target speed in m/s.
 
-        Passing speed = -1.0 returns control to SUMO's car-following model.
-        Negative speeds other than -1 are clamped to 0.
+        -1.0 is SUMO's sentinel value meaning "resume normal car-following".
+        Any other negative value is clamped to 0 to avoid undefined behavior.
         """
         if not self._vehicle_exists(vehicle_id):
             return
@@ -396,7 +433,7 @@ class ActionHandler:
         traci.vehicle.setSpeed(vehicle_id, speed)
 
     def _apply_max_speed(self, vehicle_id: str, speed: float) -> None:
-        """Set the maximum speed for vehicle_id."""
+        """Cap the vehicle's maximum allowed speed (m/s). Negative values are clamped to 0."""
         if not self._vehicle_exists(vehicle_id):
             return
         if speed < 0:
@@ -404,32 +441,30 @@ class ActionHandler:
         traci.vehicle.setMaxSpeed(vehicle_id, speed)
 
     def _reset_vehicle(self, vehicle_id: str) -> None:
-        """
-        Return vehicle_id to SUMO's default car-following model
-        by setting its speed to -1 (SUMO special value for "auto").
-        """
+        """Hand the vehicle back to SUMO's car-following model by setting speed to -1."""
         if not self._vehicle_exists(vehicle_id):
             return
         traci.vehicle.setSpeed(vehicle_id, -1.0)
 
-    def _safe_set_stop(
-        self, vid: str, road_id: str, stop_pos: float
-    ) -> bool:
+    def _safe_set_stop(self, vid: str, road_id: str, stop_pos: float) -> bool:
         """
-        Set a stop for *vid* at *stop_pos* on *road_id*, but ONLY if:
-          1. The vehicle hasn't already passed that position.
-          2. The vehicle doesn't already have a stop queued on this edge.
+        Queue a stop for a vehicle only if it is safe and not redundant.
 
-        Returns True if the stop was successfully set.
+        Two guard conditions prevent unnecessary or conflicting stop calls:
+            1. The vehicle must not have already passed stop_pos on its lane.
+            2. There must not already be a stop queued on this same edge,
+               to avoid sending duplicate setStop calls that confuse SUMO.
+
+        Returns True if a stop was actually issued, False otherwise.
         """
         try:
             current_pos = traci.vehicle.getLanePosition(vid)
             if current_pos >= stop_pos:
-                return False
+                return False  # already past the stop line, too late
 
             for stop in traci.vehicle.getNextStops(vid):
                 if stop[0].startswith(road_id):
-                    return False
+                    return False  # stop already queued on this edge
 
             traci.vehicle.setStop(vid, road_id, stop_pos)
             return True
@@ -440,14 +475,16 @@ class ActionHandler:
     @staticmethod
     def _is_outgoing_edge(edge_id: str) -> bool:
         """
-        Return True if edge_id goes toward a border node.
+        Check if an edge leads outward toward a network border node.
 
-        Border nodes start with N/S/E/W.  Outgoing edges have one of
-        these as their destination:
-            "C_to_N"          -> dest "N"       -> outgoing
-            "J0_to_N0"        -> dest "N0"      -> outgoing
-            "J_0_0_to_S_0_0"  -> dest "S_0_0"   -> outgoing
-            "J0_to_J1"        -> dest "J1"      -> NOT outgoing
+        In our naming convention, border (exit) nodes start with N, S, E, or W.
+        We parse the destination part of the edge ID to check this.
+
+        Examples:
+            "C_to_N"         -> destination "N"     -> outgoing (True)
+            "J0_to_N0"       -> destination "N0"    -> outgoing (True)
+            "J_0_0_to_S_0_0" -> destination "S_0_0" -> outgoing (True)
+            "J0_to_J1"       -> destination "J1"    -> internal road (False)
         """
         if "_to_" not in edge_id:
             return False
