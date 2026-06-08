@@ -2,30 +2,32 @@
 """
 StateExtractor
 
-Extracts the current simulation state from SUMO via the TraCI API.
+Reads the current simulation state from SUMO via TraCI and packages it into
+plain Python dicts that the rest of the project can use.
 
-Implements the two state-related functions from the specification:
-  - create_state() => full snapshot of the environment
-  - get_leaders()  => frontmost vehicle per lane
+Implements the two state functions from the project specification:
+    create_state()  -> full per-vehicle and per-edge snapshot of the simulation
+    get_leaders()   -> frontmost vehicle per incoming lane
 
-FIX vs previous version:
-  get_leaders() now filters out internal SUMO lanes (starting with ':')
-  and outgoing lanes (destination is a border node).  This reduces the
-  returned dict from hundreds of entries (most None) to just the
-  incoming lanes that the agent actually needs to make decisions about.
+Why we filter out internal lanes in get_leaders():
+    SUMO generates a large number of "internal" lanes (IDs starting with ':')
+    inside every junction box. Including them would flood the returned dict with
+    hundreds of mostly-None entries that the agent can't act on anyway. Filtering
+    them here means callers only see the lanes that actually matter for intersection
+    control decisions.
 
 TraCI calls used:
-  traci.vehicle.getIDList()
-  traci.vehicle.getSpeed()
-  traci.vehicle.getPosition()
-  traci.vehicle.getRoadID()
-  traci.vehicle.getAccumulatedWaitingTime()
-  traci.vehicle.getLaneID()
-  traci.vehicle.getLanePosition()
-  traci.edge.getLastStepOccupancy()
-  traci.edge.getLastStepMeanSpeed()
-  traci.lane.getIDList()
-  traci.simulation.getTime()
+    traci.simulation.getTime()               -> current simulation clock (s)
+    traci.vehicle.getIDList()                -> all active vehicle IDs
+    traci.vehicle.getSpeed(vid)              -> current speed (m/s)
+    traci.vehicle.getPosition(vid)           -> (x, y) world coordinates
+    traci.vehicle.getRoadID(vid)             -> edge the vehicle is currently on
+    traci.vehicle.getLaneID(vid)             -> specific lane the vehicle is on
+    traci.vehicle.getLanePosition(vid)       -> distance along the lane (m)
+    traci.vehicle.getAccumulatedWaitingTime(vid) -> total wait time since entry (s)
+    traci.edge.getLastStepOccupancy(eid)     -> fraction of edge occupied [0, 1]
+    traci.edge.getLastStepMeanSpeed(eid)     -> mean vehicle speed on the edge (m/s)
+    traci.lane.getIDList()                   -> all lane IDs in the network
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,32 +41,47 @@ except ImportError:
 
 class StateExtractor:
     """
-    Extracts and packages simulation state from TraCI.
+    Extracts and packages the current simulation state from TraCI.
 
-    Instantiated by SumoEnvironment after TraCI connects.
+    Created by SumoEnvironment once TraCI has connected. Has no internal
+    state of its own — every method queries TraCI fresh each time it's called.
     """
 
     def create_state(self) -> Dict[str, Any]:
         """
         Build a full snapshot of the current simulation state.
 
+        Queries TraCI for every active vehicle and every occupied edge, then
+        bundles everything into a single dict. This is the authoritative state
+        object consumed by the observation builder, the statistics collector,
+        and the main training loop.
+
         Returns:
-            dict with keys: simulation_time, vehicle_ids, vehicle_speeds,
-            vehicle_positions, vehicle_edges, vehicle_lanes, waiting_times,
-            edge_occupancies, edge_mean_speeds, leaders.
+            dict with the following keys:
+                simulation_time   (float) -> current clock in seconds
+                vehicle_ids       (list)  -> IDs of all active vehicles
+                vehicle_speeds    (dict)  -> {vid: speed in m/s}
+                vehicle_positions (dict)  -> {vid: (x, y) world coordinates}
+                vehicle_edges     (dict)  -> {vid: edge_id the vehicle is on}
+                vehicle_lanes     (dict)  -> {vid: lane_id the vehicle is on}
+                waiting_times     (dict)  -> {vid: accumulated wait in seconds}
+                edge_occupancies  (dict)  -> {edge_id: occupancy fraction [0,1]}
+                edge_mean_speeds  (dict)  -> {edge_id: mean speed in m/s}
+                leaders           (dict)  -> {lane_id: leader_vid | None}
         """
         state: Dict[str, Any] = {}
 
         state["simulation_time"] = traci.simulation.getTime()
 
-        vehicle_ids = list(traci.vehicle.getIDList())
+        vehicle_ids          = list(traci.vehicle.getIDList())
         state["vehicle_ids"] = vehicle_ids
 
-        speeds:     Dict[str, float]                = {}
-        positions:  Dict[str, Tuple[float, float]]  = {}
-        edges:      Dict[str, str]                  = {}
-        lanes:      Dict[str, str]                  = {}
-        wait_times: Dict[str, float]                = {}
+        # Collect all per-vehicle data in a single pass to minimise TraCI calls.
+        speeds:     Dict[str, float]               = {}
+        positions:  Dict[str, Tuple[float, float]] = {}
+        edges:      Dict[str, str]                 = {}
+        lanes:      Dict[str, str]                 = {}
+        wait_times: Dict[str, float]               = {}
 
         for vid in vehicle_ids:
             speeds[vid]     = traci.vehicle.getSpeed(vid)
@@ -79,10 +96,11 @@ class StateExtractor:
         state["vehicle_lanes"]     = lanes
         state["waiting_times"]     = wait_times
 
-        # Edge-level information
+        # Edge-level data only for real (non-internal) edges that have at least
+        # one vehicle. Internal SUMO edges start with ':' and don't carry
+        # meaningful occupancy or speed information.
         edge_occupancies: Dict[str, float] = {}
         edge_mean_speeds: Dict[str, float] = {}
-
         active_edges = {e for e in edges.values() if not e.startswith(":")}
 
         for eid in active_edges:
@@ -92,37 +110,39 @@ class StateExtractor:
         state["edge_occupancies"] = edge_occupancies
         state["edge_mean_speeds"] = edge_mean_speeds
 
+        # Attach leaders so callers don't need a separate round-trip to get them.
         state["leaders"] = self.get_leaders()
 
         return state
 
     def get_leaders(self) -> Dict[str, Optional[str]]:
         """
-        Retrieve the frontmost vehicle (leader) for every non-internal lane.
+        Find the frontmost vehicle (leader) on every real incoming lane.
 
-        FIX: Only considers lanes belonging to real (non-internal) edges.
-        Internal SUMO lanes (id starting with ':') are skipped entirely.
-        This reduces the dict from hundreds of entries to just the lanes
-        that matter for traffic control decisions.
+        "Leader" means the vehicle with the highest lane position, i.e. the one
+        closest to the end of the lane and therefore about to enter the junction
+        next. The AI agent uses this to decide who gets a green light.
 
-        Strategy:
-            1. Get all lane IDs, filter out internal lanes.
-            2. Group vehicles by lane.
-            3. For each lane, the leader is the vehicle with the highest
-               lanePosition (furthest along = closest to the intersection).
+        Internal SUMO lanes (IDs starting with ':') are excluded because they
+        exist inside junction boxes and can't be meaningfully controlled.
+
+        Algorithm:
+            1. Get all lane IDs and discard internal ones.
+            2. For each active vehicle, record which lane it's on and its position.
+            3. For each lane, pick the vehicle with the highest lane position.
 
         Returns:
-            dict : {lane_id: vehicle_id | None}
+            dict {lane_id: vehicle_id | None}
+            None means the lane is currently empty.
         """
-        all_lanes = list(traci.lane.getIDList())
-
-        # Filter: keep only non-internal lanes
+        all_lanes  = list(traci.lane.getIDList())
         real_lanes = [lid for lid in all_lanes if not lid.startswith(":")]
 
-        # Build lane -> [vehicle_id] mapping
-        lane_vehicles: Dict[str, List[str]]           = {lid: [] for lid in real_lanes}
-        lane_positions: Dict[str, Dict[str, float]]   = {lid: {} for lid in real_lanes}
+        # Pre-allocate containers for every real lane.
+        lane_vehicles:  Dict[str, List[str]]        = {lid: [] for lid in real_lanes}
+        lane_positions: Dict[str, Dict[str, float]] = {lid: {} for lid in real_lanes}
 
+        # Single pass over all active vehicles to group them by lane.
         for vid in traci.vehicle.getIDList():
             lane_id = traci.vehicle.getLaneID(vid)
             if lane_id in lane_vehicles:
@@ -130,34 +150,35 @@ class StateExtractor:
                 lane_vehicles[lane_id].append(vid)
                 lane_positions[lane_id][vid] = pos
 
-        # For each lane, leader = vehicle with highest lane position
+        # For each lane, the leader is the vehicle with the highest position
+        # (furthest along the lane = closest to the intersection).
         leaders: Dict[str, Optional[str]] = {}
         for lane_id in real_lanes:
             vehicles_on_lane = lane_vehicles[lane_id]
             if not vehicles_on_lane:
                 leaders[lane_id] = None
             else:
-                leader_id = max(
+                leaders[lane_id] = max(
                     vehicles_on_lane,
                     key=lambda v: lane_positions[lane_id][v],
                 )
-                leaders[lane_id] = leader_id
 
         return leaders
 
     @staticmethod
     def state_summary(state: Dict[str, Any]) -> str:
-        """Return a compact, human-readable summary of a state dict."""
-        n_vehicles  = len(state.get("vehicle_ids", []))
-        sim_time    = state.get("simulation_time", 0.0)
-        speeds      = list(state.get("vehicle_speeds", {}).values())
-        mean_speed  = sum(speeds) / len(speeds) if speeds else 0.0
-        waiting     = sum(
-            1 for w in state.get("waiting_times", {}).values() if w > 0
-        )
-        n_leaders   = sum(
-            1 for v in state.get("leaders", {}).values() if v is not None
-        )
+        """
+        Return a compact one-line summary of a state dict.
+
+        Useful for quick sanity checks during development -> call it whenever
+        you want to log what's happening without dumping the full state object.
+        """
+        n_vehicles = len(state.get("vehicle_ids", []))
+        sim_time   = state.get("simulation_time", 0.0)
+        speeds     = list(state.get("vehicle_speeds", {}).values())
+        mean_speed = sum(speeds) / len(speeds) if speeds else 0.0
+        waiting    = sum(1 for w in state.get("waiting_times", {}).values() if w > 0)
+        n_leaders  = sum(1 for v in state.get("leaders", {}).values() if v is not None)
 
         return (
             f"t={sim_time:.1f}s | "
